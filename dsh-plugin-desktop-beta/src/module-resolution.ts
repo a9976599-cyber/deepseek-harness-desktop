@@ -35,6 +35,7 @@ interface ProfileResolverRegistration {
   readonly sharedFallbackDirectory: string
   readonly moduleSources: Map<string, ModuleSource>
   readonly canonicalPaths: Map<string, string>
+  readonly canonicalModuleKeys: Map<string, string>
   readonly overlayCandidates: Map<string, PackageOverlayCandidate>
   readonly activeSequences: Set<number>
   readonly profileRequire: NodeJS.Require
@@ -121,6 +122,7 @@ function canonicalPath(registration: ProfileResolverRegistration, candidate: str
 
 function refreshCanonicalProfilePath(registration: ProfileResolverRegistration): void {
   registration.canonicalPaths.clear()
+  registration.canonicalModuleKeys.clear()
   const canonical = resolvedRealPath(registration.profileDirectory)
   if (canonical !== undefined) {
     registration.canonicalPaths.set(registration.profileDirectory, canonical)
@@ -128,13 +130,19 @@ function refreshCanonicalProfilePath(registration: ProfileResolverRegistration):
 }
 
 function canonicalModuleKey(registration: ProfileResolverRegistration, url: string): string {
+  const cached = registration.canonicalModuleKeys.get(url)
+  if (cached !== undefined) return cached
   const candidate = filePath(url)
   if (candidate === undefined) return url
   const parsed = new URL(url)
   const normalized = pathToFileURL(canonicalPath(registration, candidate))
   normalized.search = parsed.search
   normalized.hash = parsed.hash
-  return normalized.href
+  const key = normalized.href
+  // Cache only successful filesystem identities, never a missing generated
+  // module. Keep query/hash in the key and invalidate alongside paths on HMR.
+  if (registration.canonicalPaths.has(candidate)) registration.canonicalModuleKeys.set(url, key)
+  return key
 }
 
 function isLexicallyWithin(directory: string, candidate: string): boolean {
@@ -468,7 +476,7 @@ function resolveFilenameWithState(
   isMain: boolean | undefined,
   options?: unknown,
 ): string {
-  if (state.bypassDepth > 0) {
+  if (state.bypassDepth > 0 || isBuiltin(request)) {
     return state.previousResolveFilename.call(thisArg, request, parent, isMain, options)
   }
   const parentURL = parent?.filename === undefined ? undefined : pathToFileURL(parent.filename).href
@@ -597,7 +605,8 @@ function resolveWithState(
   context: Parameters<ResolveHookSync>[1],
   nextResolve: Parameters<ResolveHookSync>[2],
 ): ReturnType<ResolveHookSync> {
-  if (state.bypassDepth > 0) return nextResolve(specifier, context)
+  // Builtins cannot be overlaid by a Profile and have no filesystem owner.
+  if (state.bypassDepth > 0 || isBuiltin(specifier)) return nextResolve(specifier, context)
   const parentRegistration = registrationForParent(state, context.parentURL)
   return parentRegistration === undefined
     ? nextResolve(specifier, context)
@@ -610,12 +619,14 @@ function migrateResolverState(state: ProcessResolverState): void {
     const mutable = registration as unknown as {
       activeSequences?: Set<number>
       canonicalPaths?: Map<string, string>
+      canonicalModuleKeys?: Map<string, string>
       overlayCandidates?: Map<string, PackageOverlayCandidate>
     }
     // v1 is intentionally retained as the process symbol because an earlier
     // HMR generation already owns the live Node hooks. Upgrade its objects in
     // place instead of registering a second resolver stack.
     mutable.canonicalPaths = new Map()
+    mutable.canonicalModuleKeys = new Map()
     mutable.overlayCandidates = new Map()
     if (!(mutable.activeSequences instanceof Set)) {
       mutable.activeSequences = new Set(
@@ -706,6 +717,7 @@ export function installProfilePackageResolver(profileBaseUrl: string): () => voi
       sharedFallbackDirectory: join(dirname(profileDirectory), 'node_modules'),
       moduleSources: new Map(),
       canonicalPaths: new Map(),
+      canonicalModuleKeys: new Map(),
       overlayCandidates: new Map(),
       activeSequences: new Set(),
       profileRequire: createRequire(normalizedBaseUrl),

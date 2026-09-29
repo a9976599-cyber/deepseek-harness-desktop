@@ -14,6 +14,10 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  beginDesktopSetupWizard,
+  desktopSetupWizardPending,
+  desktopSetupAccountPending,
+  dismissDesktopSetupAccount,
   clearDesktopSetupWizardState,
   completeOrSkipDesktopSetupWizard,
   desktopSetupWizardProfileHash,
@@ -26,6 +30,23 @@ import {
 } from '../src/setup-wizard-state.ts'
 
 const temporaryDirectories: string[] = []
+
+it('resumes the account choice after completion, independently for each Profile', async () => {
+  const root = temporaryDirectory('dsh-account-setup-')
+  const first = join(root, 'first'), second = join(root, 'second')
+  expect(desktopSetupAccountPending(root, first)).toBe(false)
+  await recordSetup(root, first, 'completed')
+  expect(desktopSetupAccountPending(root, first)).toBe(true)
+  expect(desktopSetupAccountPending(root, second)).toBe(false)
+  await recordSetup(root, second, 'skipped')
+  expect(desktopSetupAccountPending(root, second)).toBe(false)
+  dismissDesktopSetupAccount(root, first)
+  expect(desktopSetupAccountPending(root, first)).toBe(false)
+  expect(readDesktopSetupWizardState(root, first)?.outcome).toBe('completed')
+  await recordSetup(root, first, 'completed')
+  await clearDesktopSetupWizardState(root, first)
+  expect(desktopSetupAccountPending(root, first)).toBe(false)
+})
 const RECORDED_AT = '2026-08-28T04:05:06.789Z'
 const CURRENT_VERSIONS: DesktopSetupWizardVersions = Object.freeze({
   desktopVersion: '2.0.3',
@@ -65,6 +86,22 @@ function writeState(userData: string, profile: string, value: unknown): string {
 }
 
 describe('Desktop Setup Wizard state', () => {
+  it('resumes an interrupted live-client setup and clears pending on completion or reset', async () => {
+    const userData = temporaryDirectory('dsh-setup-pending-user-')
+    const profile = temporaryDirectory('dsh-setup-pending-profile-')
+    expect(desktopSetupWizardPending(userData, profile)).toBe(false)
+    await beginDesktopSetupWizard(userData, profile)
+    expect(desktopSetupWizardPending(userData, profile)).toBe(true)
+    expect(desktopSetupWizardRequired(readDesktopSetupWizardState(userData, profile), CURRENT_VERSIONS)).toBe(true)
+    await recordSetup(userData, profile, 'completed')
+    expect(desktopSetupWizardPending(userData, profile)).toBe(false)
+    expect(desktopSetupWizardRequired(readDesktopSetupWizardState(userData, profile), CURRENT_VERSIONS)).toBe(false)
+    await clearDesktopSetupWizardState(userData, profile)
+    await beginDesktopSetupWizard(userData, profile)
+    await clearDesktopSetupWizardState(userData, profile)
+    expect(desktopSetupWizardPending(userData, profile)).toBe(false)
+  })
+
   it('isolates explicit completion and skip markers by sha256(Profile directory)', async () => {
     const userData = temporaryDirectory('dsh-setup-state-user-')
     const profiles = temporaryDirectory('dsh-setup-state-profiles-')
@@ -112,7 +149,7 @@ describe('Desktop Setup Wizard state', () => {
       ...CURRENT_VERSIONS,
       recordedAt: RECORDED_AT,
     })
-    expect(readdirSync(directory)).toEqual(['state.json'])
+    expect(readdirSync(directory)).toEqual(['state.json', 'state.json.account'])
     if (process.platform !== 'win32') {
       expect(statSync(join(userData, 'profile-setup')).mode & 0o777).toBe(0o700)
       expect(statSync(directory).mode & 0o777).toBe(0o700)
@@ -120,7 +157,7 @@ describe('Desktop Setup Wizard state', () => {
     }
   })
 
-  it('reads legacy V1 markers and replaces them with current V2 evidence after Setup', async () => {
+  it('honors legacy V1 decisions and permits explicit V2 recording', async () => {
     const userData = temporaryDirectory('dsh-setup-state-user-')
     const profile = temporaryDirectory('dsh-setup-state-profile-')
     const profileHash = desktopSetupWizardProfileHash(profile)
@@ -132,7 +169,7 @@ describe('Desktop Setup Wizard state', () => {
 
     const legacy = readDesktopSetupWizardState(userData, profile)
     expect(legacy).toEqual({ version: 1, profileHash, outcome: 'skipped' })
-    expect(desktopSetupWizardRequired(legacy, CURRENT_VERSIONS)).toBe(true)
+    expect(desktopSetupWizardRequired(legacy, CURRENT_VERSIONS)).toBe(false)
 
     await recordSetup(userData, profile, 'completed')
     expect(readDesktopSetupWizardState(userData, profile)).toEqual({
@@ -144,7 +181,7 @@ describe('Desktop Setup Wizard state', () => {
     })
   })
 
-  it('requires Setup only for monotonic Desktop, DSH, or Wizard revision upgrades', async () => {
+  it('does not repeat Setup for Desktop, DSH, or Wizard revision changes', async () => {
     const userData = temporaryDirectory('dsh-setup-state-user-')
     const profile = temporaryDirectory('dsh-setup-state-profile-')
     await recordSetup(userData, profile, 'completed')
@@ -155,15 +192,15 @@ describe('Desktop Setup Wizard state', () => {
     expect(desktopSetupWizardRequired(state, {
       ...CURRENT_VERSIONS,
       desktopVersion: '2.0.4',
-    })).toBe(true)
+    })).toBe(false)
     expect(desktopSetupWizardRequired(state, {
       ...CURRENT_VERSIONS,
       dshVersion: '0.1.2-alpha.2',
-    })).toBe(true)
+    })).toBe(false)
     expect(desktopSetupWizardRequired(state, {
       ...CURRENT_VERSIONS,
       setupRevision: CURRENT_VERSIONS.setupRevision + 1,
-    })).toBe(true)
+    })).toBe(false)
 
     expect(desktopSetupWizardRequired(state, {
       ...CURRENT_VERSIONS,
@@ -177,7 +214,19 @@ describe('Desktop Setup Wizard state', () => {
       ...CURRENT_VERSIONS,
       desktopVersion: '2.0.4',
       dshVersion: '0.1.1-rc.1',
-    })).toBe(true)
+    })).toBe(false)
+  })
+
+  it.each(['completed', 'skipped'] as const)('keeps %s decisions across Stable/Beta switches in either direction', async outcome => {
+    const userData = temporaryDirectory('dsh-setup-state-user-')
+    const profile = temporaryDirectory('dsh-setup-state-profile-')
+    for (const desktopVersion of ['2.0.5', '2.0.6-beta.1']) {
+      const state = await recordSetup(userData, profile, outcome, { ...CURRENT_VERSIONS, desktopVersion })
+      for (const nextVersion of ['2.0.4', '2.0.6', '2.0.7-beta.1']) {
+        expect(desktopSetupWizardRequired(state, { ...CURRENT_VERSIONS, desktopVersion: nextVersion })).toBe(false)
+      }
+      expect(readDesktopSetupWizardState(userData, profile)).toEqual(state)
+    }
   })
 
   it('strictly rejects malformed V2 version evidence and write inputs', async () => {

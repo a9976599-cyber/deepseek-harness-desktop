@@ -174,7 +174,8 @@ describe('DesktopDialogWindow', () => {
     await expect(result).resolves.toEqual({ response: 0 })
   })
 
-  it('keeps Profile compatibility guidance outside the version detail', async () => {
+  it('sizes the macOS Profile compatibility notice to its content without extra height', async () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin')
     const result = new DesktopDialogWindow({
       type: 'warning',
       title: 'Profile compatibility warning',
@@ -197,6 +198,9 @@ describe('DesktopDialogWindow', () => {
       presentation: 'profile-compatibility',
       advisory: 'Warning: DSH version differences may make plugins unavailable.',
     })
+    window?.webListeners.get('preferred-size-changed')?.({}, { width: 480, height: 320 })
+    window?.webListeners.get('did-finish-load')?.()
+    expect(window?.setContentSize).toHaveBeenCalledWith(480, 320, false)
     window?.webListeners.get('will-navigate')?.(
       { preventDefault: vi.fn() },
       'dsh-desktop-dialog://response?id=2',

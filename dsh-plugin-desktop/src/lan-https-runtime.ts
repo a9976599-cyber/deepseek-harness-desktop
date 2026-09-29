@@ -24,6 +24,10 @@ export interface DesktopLanHttpsRuntimeOptions {
   readonly addresses: readonly string[]
   /** Leaf key/chain and installation-local CA, when secure persistence succeeded. */
   readonly certificate?: DesktopLanHttpsCertificate
+  /** Called only when LAN access is first requested, never for loopback boot. */
+  readonly prepareCertificate?: () => Promise<
+    { readonly certificate: DesktopLanHttpsCertificate } | { readonly failureCode: string }
+  >
   /** Stable certificate bootstrap failure shown only if LAN is requested. */
   readonly failureCode?: string
   /** Public HTTPS port; zero asks the operating system for a free port. */
@@ -60,10 +64,12 @@ function projectIngress(snapshot: LanHttpsIngressSnapshot): DesktopLanHttpsRunti
  * attach the HTTPS edge after the upstream loopback port is known.
  */
 export class DesktopLanHttpsRuntime {
-  readonly caCertificate: string | null
   private readonly addresses: readonly string[]
-  private readonly certificate: DesktopLanHttpsCertificate | undefined
-  private readonly failureCode: string
+  private certificate: DesktopLanHttpsCertificate | undefined
+  private failureCode: string
+  private readonly prepareCertificate: DesktopLanHttpsRuntimeOptions['prepareCertificate']
+  private serial: Promise<void> = Promise.resolve()
+  private enabled = false
   private readonly requestedPort: number
   private ingress: LanHttpsIngress | undefined
   private targetPort: number | undefined
@@ -72,7 +78,7 @@ export class DesktopLanHttpsRuntime {
   constructor(options: DesktopLanHttpsRuntimeOptions) {
     this.addresses = Object.freeze([...options.addresses])
     this.certificate = options.certificate
-    this.caCertificate = options.certificate?.caCertificate ?? null
+    this.prepareCertificate = options.prepareCertificate
     this.failureCode = options.failureCode ?? 'certificate-unavailable'
     this.requestedPort = options.requestedPort ?? 0
     this.current = frozenSnapshot(
@@ -83,6 +89,10 @@ export class DesktopLanHttpsRuntime {
     )
   }
 
+  get caCertificate(): string | null {
+    return this.certificate?.caCertificate ?? null
+  }
+
   /** Attach exactly once to the actual loopback WebServer port. */
   attach(targetPort: number): void {
     if (this.targetPort !== undefined) {
@@ -90,8 +100,13 @@ export class DesktopLanHttpsRuntime {
       throw new Error('dsh-plugin-desktop: LAN HTTPS runtime is already attached to another port')
     }
     this.targetPort = targetPort
+    this.attachIngress()
+  }
+
+  private attachIngress(): void {
     const certificate = this.certificate
-    if (certificate === undefined) return
+    const targetPort = this.targetPort
+    if (certificate === undefined || targetPort === undefined || this.ingress !== undefined) return
     this.ingress = new LanHttpsIngress({
       targetPort,
       requestedPort: this.requestedPort,
@@ -113,6 +128,26 @@ export class DesktopLanHttpsRuntime {
     if (typeof enabled !== 'boolean') {
       throw new TypeError('dsh-plugin-desktop: LAN HTTPS enabled state must be a boolean')
     }
+    this.enabled = enabled
+    const transition = this.serial.then(async () => {
+      if (enabled && this.enabled && this.certificate === undefined && this.prepareCertificate !== undefined) {
+        this.current = frozenSnapshot('starting', this.addresses, null, null)
+        try {
+          const result = await this.prepareCertificate()
+          if ('certificate' in result) this.certificate = result.certificate
+          else this.failureCode = result.failureCode
+        } catch {
+          this.failureCode = 'certificate-unavailable'
+        }
+        this.attachIngress()
+      }
+      return this.applyEnabled(enabled && this.enabled)
+    })
+    this.serial = transition.then(() => undefined, () => undefined)
+    return transition
+  }
+
+  private async applyEnabled(enabled: boolean): Promise<DesktopLanHttpsRuntimeSnapshot> {
     const ingress = this.ingress
     if (ingress === undefined) {
       this.current = enabled

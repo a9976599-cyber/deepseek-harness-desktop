@@ -15,6 +15,8 @@ export const DESKTOP_PROFILE_SELECT_PATH = '/api/desktop/profiles/select'
 export const DESKTOP_PROFILE_DELETE_PATH = '/api/desktop/profiles/delete'
 
 /** Persist the Market provider selected for the next Desktop generation. */
+export const DESKTOP_AA_SELECT_PATH = '/api/desktop/aa/select'
+
 export const DESKTOP_MARKET_SELECT_PATH = '/api/desktop/market/select'
 
 /** Open the launcher-owned DSH terminal without accepting command text. */
@@ -37,9 +39,6 @@ export const DESKTOP_UPDATE_CHECK_PATH = '/api/desktop/updates/check'
 
 /** Export one local diagnostic archive through the launcher-owned flow. */
 export const DESKTOP_DIAGNOSTICS_EXPORT_PATH = '/api/desktop/diagnostics/export'
-
-/** Open the isolated native Profile creator without accepting a path. */
-export const DESKTOP_PROFILE_CREATE_WINDOW_PATH = '/api/desktop/profiles/create-window'
 
 /** Renderer-safe projection of one discovered profile. */
 export interface DesktopSettingsProfileView {
@@ -88,6 +87,7 @@ export interface DesktopSettingsResponse {
   /** Fresh profile discovery without filesystem paths or manifest details. */
   readonly profiles: readonly DesktopSettingsProfileView[]
   /** Market choice for the current and next generation. */
+  readonly aa: { readonly requested: boolean; readonly effective: boolean }
   readonly market: DesktopSettingsMarketView
   /** Actual browser URLs for the current WebServer generation. */
   readonly web: DesktopSettingsWebView
@@ -182,14 +182,6 @@ export type DesktopDiagnosticsExportRequest = Readonly<Record<string, never>>
 
 /** Successful handoff to the launcher-owned diagnostic export flow. */
 export interface DesktopDiagnosticsExportResponse {
-  readonly accepted: true
-}
-
-/** Exact empty body accepted by the native Profile-creator endpoint. */
-export type DesktopProfileCreateWindowRequest = Readonly<Record<string, never>>
-
-/** Successful handoff to the isolated native Profile creator. */
-export interface DesktopProfileCreateWindowResponse {
   readonly accepted: true
 }
 

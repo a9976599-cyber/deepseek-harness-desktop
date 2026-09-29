@@ -149,12 +149,12 @@ describe('desktop update Host plugin', () => {
     const request = vi.fn(async (_url: string, init: RequestInit) => {
       const channel = new Headers(init.headers).get(DESKTOP_RELEASE_CHANNEL_HEADER)
       return Response.json(channel === 'beta'
-        ? { version: '2.0.5-beta.2', channel: 'beta' }
+        ? { version: '2.0.6-beta.1', channel: 'beta' }
         : { version: '2.0.4', channel: 'stable' })
     })
     const harness = await createHarness({
       releaseChannel: 'beta',
-      currentVersion: '2.0.5-beta.2',
+      currentVersion: '2.0.6-beta.1',
       request,
       confirmDownload: async () => true,
     })

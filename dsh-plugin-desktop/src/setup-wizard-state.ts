@@ -15,7 +15,7 @@ import {
 import type { Stats } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
-import { compareSemVerVersions, parseSemVer } from './update-checker.ts'
+import { parseSemVer } from './update-checker.ts'
 
 const BIN_NAME = 'dsh-plugin-desktop'
 const LEGACY_STATE_VERSION = 1
@@ -264,24 +264,53 @@ export function readDesktopSetupWizardState(
   return parseState(text, desktopSetupWizardProfileHash(profileDir))
 }
 
-/**
- * Decide whether the current installation needs the existing complete Wizard.
- * Any forward version or revision change requires it. Equal versions and pure
- * rollbacks do not rewrite the newer marker.
- */
+/** Host boot can create usage history before onboarding finishes. Keep that run resumable. */
+export function desktopSetupWizardPending(userDataDir: string, profileDir: string): boolean {
+  const path = desktopSetupWizardStatePath(userDataDir, profileDir)
+  if (existingPathInfo(dirname(dirname(path))) === undefined) return false
+  assertPrivateDirectory(dirname(dirname(path)))
+  if (existingPathInfo(dirname(path)) === undefined) return false
+  assertPrivateDirectory(dirname(path))
+  const value = readStateBytes(`${path}.pending`)
+  if (value !== undefined && value !== 'pending\n') throw invalid('invalid pending marker')
+  return value !== undefined
+}
+
+export async function beginDesktopSetupWizard(userDataDir: string, profileDir: string): Promise<void> {
+  const path = desktopSetupWizardStatePath(userDataDir, profileDir)
+  ensurePrivateDirectory(dirname(dirname(path)))
+  ensurePrivateDirectory(dirname(path))
+  assertSafeStateTarget(`${path}.pending`)
+  await writeFileAtomic(`${path}.pending`, 'pending\n', { mode: STATE_FILE_MODE, dirMode: STATE_DIRECTORY_MODE })
+}
+
+/** Resume the optional official login entry after applying Desktop preferences. */
+export function desktopSetupAccountPending(userDataDir: string, profileDir: string): boolean {
+  const path = desktopSetupWizardStatePath(userDataDir, profileDir)
+  if (readDesktopSetupWizardState(userDataDir, profileDir) === undefined) return false
+  const text = readStateBytes(`${path}.account`)
+  if (text !== undefined && text !== 'pending\n') throw invalid('invalid account continuation')
+  return text !== undefined
+}
+
+export function dismissDesktopSetupAccount(userDataDir: string, profileDir: string): void {
+  if (!desktopSetupAccountPending(userDataDir, profileDir)) return
+  unlinkSync(`${desktopSetupWizardStatePath(userDataDir, profileDir)}.account`)
+}
+
+function clearPending(path: string): void {
+  if (existingPathInfo(`${path}.pending`) === undefined) return
+  assertSafeStateTarget(`${path}.pending`)
+  unlinkSync(`${path}.pending`)
+}
+
+/** Setup is a one-time Profile decision; recorded versions are diagnostic only. */
 export function desktopSetupWizardRequired(
   state: DesktopSetupWizardState | undefined,
   currentVersions: DesktopSetupWizardVersions,
 ): boolean {
-  const current = normalizedVersions(currentVersions)
-  if (state === undefined || state.version === LEGACY_STATE_VERSION) return true
-  const desktop = compareSemVerVersions(current.desktopVersion, state.desktopVersion)
-  const dsh = compareSemVerVersions(current.dshVersion, state.dshVersion)
-  if (desktop === null || dsh === null) {
-    throw new Error(`${BIN_NAME}: validated Setup Wizard versions could not be compared`)
-  }
-  const revision = current.setupRevision - state.setupRevision
-  return desktop > 0 || dsh > 0 || revision > 0
+  normalizedVersions(currentVersions)
+  return state === undefined
 }
 
 /** Atomically record explicit completion or an explicit skip for one Profile. */
@@ -314,11 +343,16 @@ export async function completeOrSkipDesktopSetupWizard(
   assertSafeStateTarget(path)
   const current = readStateBytes(path)
   if (current !== undefined) parseState(current, profileHash)
+  assertSafeStateTarget(`${path}.account`)
+  if (outcome === 'completed') {
+    await writeFileAtomic(`${path}.account`, 'pending\n', { mode: STATE_FILE_MODE, dirMode: STATE_DIRECTORY_MODE })
+  } else if (existingPathInfo(`${path}.account`) !== undefined) unlinkSync(`${path}.account`)
   await writeFileAtomic(path, `${JSON.stringify(state, undefined, 2)}\n`, {
     mode: STATE_FILE_MODE,
     dirMode: STATE_DIRECTORY_MODE,
   })
   if (CHECK_POSIX_MODE) chmodSync(path, STATE_FILE_MODE)
+  clearPending(path)
   return state
 }
 
@@ -332,6 +366,9 @@ export function clearDesktopSetupWizardStateSync(
   assertPrivateDirectory(dirname(dirname(path)))
   if (existingPathInfo(dirname(path)) === undefined) return
   assertPrivateDirectory(dirname(path))
+  clearPending(path)
+  assertSafeStateTarget(`${path}.account`)
+  if (existingPathInfo(`${path}.account`) !== undefined) unlinkSync(`${path}.account`)
   const info = existingPathInfo(path)
   if (info === undefined) return
   assertSafeStateTarget(path)

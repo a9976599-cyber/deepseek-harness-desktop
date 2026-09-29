@@ -15,6 +15,7 @@ import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   clearDesktopProfilePreferences,
+  desktopProfilePreferencesFromSettings,
   desktopProfilePreferencesConstants,
   desktopProfilePreferencesProfileHash,
   desktopProfilePreferencesStatePath,
@@ -26,6 +27,7 @@ import {
 const temporaryDirectories: string[] = []
 const RECORDED_AT = '2026-08-28T06:07:08.901Z'
 const PREFERENCES: DesktopProfilePreferences = Object.freeze({
+  aaEnabled: false,
   mode: 'compatibility',
   openBrowser: true,
   networkExposure: 'lan',
@@ -35,6 +37,8 @@ const PREFERENCES: DesktopProfilePreferences = Object.freeze({
     notifyOnTurnFailure: false,
     notifyOnJobCompletion: false,
     notifyOnJobFailure: true,
+    notifyOnScheduleCompletion: true,
+    notifyOnScheduleFailure: true,
   }),
   market: 'community-market',
 })
@@ -67,6 +71,55 @@ afterEach(() => {
 })
 
 describe('Desktop Profile preferences', () => {
+  it('toggles AA after reloading durable state without leaking state metadata into the update', async () => {
+    const userData = temporaryDirectory('dsh-aa-toggle-')
+    const profile = temporaryDirectory('dsh-aa-profile-')
+    await writeDesktopProfilePreferences(userData, profile, PREFERENCES)
+    for (const enabled of [true, false, true]) {
+      const stored = readDesktopProfilePreferences(userData, profile)!
+      expect(stored).toHaveProperty('profileHash')
+      expect(stored).toHaveProperty('version')
+      expect(stored).toHaveProperty('recordedAt')
+      const update = desktopProfilePreferencesFromSettings(stored, stored.notifications, stored.market, enabled)
+      await writeDesktopProfilePreferences(userData, profile, update)
+      expect(readDesktopProfilePreferences(userData, profile)).toMatchObject({
+        ...PREFERENCES, aaEnabled: enabled,
+      })
+    }
+  })
+
+  it('defaults legacy preferences to AA off and keeps choices isolated across Profiles', async () => {
+    const userData = temporaryDirectory('dsh-aa-preferences-')
+    const work = temporaryDirectory('dsh-aa-work-')
+    const other = temporaryDirectory('dsh-aa-other-')
+    const { aaEnabled: _aa, ...legacy } = PREFERENCES
+    writeRawState(userData, work, { ...legacy, version: 1,
+      profileHash: desktopProfilePreferencesProfileHash(work), recordedAt: RECORDED_AT })
+    expect(readDesktopProfilePreferences(userData, work)?.aaEnabled).toBe(false)
+    writeRawState(userData, work, { ...legacy, version: 1, aaEnabled: null,
+      profileHash: desktopProfilePreferencesProfileHash(work), recordedAt: RECORDED_AT })
+    expect(() => readDesktopProfilePreferences(userData, work)).toThrow('aaEnabled')
+    writeRawState(userData, work, { ...legacy, version: 1,
+      profileHash: desktopProfilePreferencesProfileHash(work), recordedAt: RECORDED_AT })
+    await writeDesktopProfilePreferences(userData, work, { ...PREFERENCES, aaEnabled: true })
+    await writeDesktopProfilePreferences(userData, other, PREFERENCES)
+    expect(readDesktopProfilePreferences(userData, work)?.aaEnabled).toBe(true)
+    expect(readDesktopProfilePreferences(userData, other)?.aaEnabled).toBe(false)
+    await expect(writeDesktopProfilePreferences(userData, work, { ...PREFERENCES,
+      aaEnabled: 'true' as unknown as boolean })).rejects.toThrow('aaEnabled')
+  })
+
+  it('reads saved five-switch notification preferences with schedule switches enabled', () => {
+    const userData = temporaryDirectory('dsh-schedule-preferences-')
+    const profile = temporaryDirectory('dsh-schedule-profile-')
+    const { notifyOnScheduleCompletion: _completion, notifyOnScheduleFailure: _failure, ...notifications } = PREFERENCES.notifications
+    writeRawState(userData, profile, { ...PREFERENCES, notifications, version: 1,
+      profileHash: desktopProfilePreferencesProfileHash(profile), recordedAt: RECORDED_AT })
+    expect(readDesktopProfilePreferences(userData, profile)?.notifications).toEqual({
+      ...notifications, notifyOnScheduleCompletion: true, notifyOnScheduleFailure: true,
+    })
+  })
+
   it('isolates strict state by sha256(Profile directory)', async () => {
     const userData = temporaryDirectory('dsh-profile-preferences-user-')
     const profiles = temporaryDirectory('dsh-profile-preferences-profiles-')
@@ -113,6 +166,7 @@ describe('Desktop Profile preferences', () => {
 
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(expected)
     expect(Object.keys(JSON.parse(readFileSync(path, 'utf8')) as object).sort()).toEqual([
+      'aaEnabled',
       'market',
       'mode',
       'networkExposure',
@@ -152,7 +206,7 @@ describe('Desktop Profile preferences', () => {
         ...PREFERENCES.notifications,
         extra: true,
       } as DesktopProfilePreferences['notifications'],
-    }, RECORDED_AT)).rejects.toThrow('five supported boolean fields')
+    }, RECORDED_AT)).rejects.toThrow('supported boolean fields')
     await expect(writeDesktopProfilePreferences(userData, profile, PREFERENCES, '2026-08-28'))
       .rejects.toThrow('recordedAt')
 

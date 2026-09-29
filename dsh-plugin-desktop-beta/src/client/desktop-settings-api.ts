@@ -1,9 +1,16 @@
 /** Same-origin browser client for launcher-owned Desktop settings operations. */
 
+import {
+  DESKTOP_RENDERER_ACTIONS_BRIDGE,
+  type DesktopRendererAction,
+  type DesktopRendererActionsBridge,
+} from '../renderer-actions-contract.ts'
+
 const SETTINGS_PATH = '/api/desktop/settings'
 const PROFILE_CREATE_PATH = '/api/desktop/profiles/create'
 const PROFILE_SELECT_PATH = '/api/desktop/profiles/select'
 const PROFILE_DELETE_PATH = '/api/desktop/profiles/delete'
+const AA_SELECT_PATH = '/api/desktop/aa/select'
 const MARKET_SELECT_PATH = '/api/desktop/market/select'
 const TERMINAL_OPEN_PATH = '/api/desktop/terminal/open'
 const RESTART_PATH = '/api/desktop/restart'
@@ -57,6 +64,7 @@ export interface DesktopWebView {
 export interface DesktopSettingsView {
   readonly current: string
   readonly profiles: readonly DesktopProfileView[]
+  readonly aa?: { readonly requested: boolean; readonly effective: boolean }
   readonly market: DesktopMarketView
   readonly web: DesktopWebView
 }
@@ -73,7 +81,11 @@ export interface DesktopSettingsApi {
   createProfile(name: string): Promise<DesktopSettingsView>
   selectProfile(name: string): Promise<DesktopRestartAcceptance>
   deleteProfile(name: string): Promise<DesktopSettingsView>
+  selectAa?(enabled: boolean): Promise<DesktopRestartAcceptance>
   selectMarket(provider: DesktopMarketProvider): Promise<DesktopRestartAcceptance>
+  /** Optional native actions for individual browser login URLs. */
+  openBrowser?(url: string): Promise<void>
+  copyBrowser?(url: string): Promise<void>
   openTerminal(): Promise<void>
   restart(): Promise<void>
   restartToRecovery(): Promise<void>
@@ -202,6 +214,7 @@ export function parseDesktopSettingsView(value: unknown): DesktopSettingsView {
     || value.current.length > MAX_PROFILE_NAME_LENGTH
     || !Array.isArray(value.profiles)
     || value.profiles.length > MAX_PROFILES
+    || (value.aa !== undefined && (!isObject(value.aa) || typeof value.aa.requested !== 'boolean' || typeof value.aa.effective !== 'boolean'))
     || !isObject(value.market)
     || !isMarketProvider(value.market.requested)
     || !isMarketProvider(value.market.effective)
@@ -243,6 +256,7 @@ export function parseDesktopSettingsView(value: unknown): DesktopSettingsView {
   return Object.freeze({
     current: value.current,
     profiles: Object.freeze(profiles),
+    aa: Object.freeze(isObject(value.aa) ? { requested: value.aa.requested as boolean, effective: value.aa.effective as boolean } : { requested: false, effective: false }),
     market: Object.freeze({
       requested: value.market.requested,
       effective: value.market.effective,
@@ -300,8 +314,42 @@ function post(fetcher: FetchLike, path: string, body: object): Promise<Response>
   })
 }
 
-/** Construct the default same-origin API, with a fetch seam for focused tests. */
-export function createDesktopSettingsApi(fetcher: FetchLike = globalThis.fetch.bind(globalThis)): DesktopSettingsApi {
+/**
+ * Resolve the Electron-owned actions bridge published by the Desktop preload.
+ * @param scope - global object carrying the context-isolated bridge.
+ * @returns the bridge inside the Desktop shell, or undefined in a browser.
+ */
+export function desktopRendererActionsBridge(
+  scope: Record<string, unknown> = globalThis as unknown as Record<string, unknown>,
+): DesktopRendererActionsBridge | undefined {
+  const bridge: unknown = scope[DESKTOP_RENDERER_ACTIONS_BRIDGE]
+  if (bridge === null || typeof bridge !== 'object') return undefined
+  return typeof (bridge as { invoke?: unknown }).invoke === 'function'
+    ? bridge as DesktopRendererActionsBridge
+    : undefined
+}
+
+/**
+ * Construct the default same-origin API, with fetch and bridge seams for tests.
+ *
+ * Desktop-owned native operations run on the Electron lifetime whenever the
+ * preload bridge is present, so they survive a Host generation that exited.
+ * An ordinary browser has no bridge and keeps the loopback Host routes.
+ */
+export function createDesktopSettingsApi(
+  fetcher: FetchLike = globalThis.fetch.bind(globalThis),
+  bridge: DesktopRendererActionsBridge | undefined = desktopRendererActionsBridge(),
+): DesktopSettingsApi {
+  const native = async (
+    action: DesktopRendererAction,
+    request: () => Promise<Response>,
+  ): Promise<void> => {
+    if (bridge !== undefined) {
+      await bridge.invoke(action)
+      return
+    }
+    parseDesktopActionAcceptance(await readResponse(await request()))
+  }
   return Object.freeze({
     async read() {
       const response = await fetcher(SETTINGS_PATH, {
@@ -322,29 +370,32 @@ export function createDesktopSettingsApi(fetcher: FetchLike = globalThis.fetch.b
     async deleteProfile(name: string) {
       return parseDesktopSettingsView(await readResponse(await post(fetcher, PROFILE_DELETE_PATH, { name })))
     },
+    async selectAa(enabled: boolean) {
+      return parseDesktopRestartAcceptance(await readResponse(await post(fetcher, AA_SELECT_PATH, { enabled })))
+    },
     async selectMarket(provider: DesktopMarketProvider) {
       return parseDesktopRestartAcceptance(await readResponse(await post(fetcher, MARKET_SELECT_PATH, { provider })))
     },
     async openTerminal() {
-      parseDesktopActionAcceptance(await readResponse(await post(fetcher, TERMINAL_OPEN_PATH, {})))
+      await native('terminal', () => post(fetcher, TERMINAL_OPEN_PATH, {}))
     },
     async restart() {
-      parseDesktopActionAcceptance(await readResponse(await post(fetcher, RESTART_PATH, {})))
+      await native('restart', () => post(fetcher, RESTART_PATH, {}))
     },
     async restartToRecovery() {
-      parseDesktopActionAcceptance(await readResponse(await post(fetcher, RECOVERY_RESTART_PATH, {})))
+      await native('restart-recovery', () => post(fetcher, RECOVERY_RESTART_PATH, {}))
     },
     async reloadRenderer() {
-      parseDesktopActionAcceptance(await readResponse(await post(fetcher, RENDERER_RELOAD_PATH, {})))
+      await native('reload', () => post(fetcher, RENDERER_RELOAD_PATH, {}))
     },
     async toggleDeveloperTools() {
-      parseDesktopActionAcceptance(await readResponse(await post(fetcher, DEVELOPER_TOOLS_TOGGLE_PATH, {})))
+      await native('developer', () => post(fetcher, DEVELOPER_TOOLS_TOGGLE_PATH, {}))
     },
     async checkForUpdates() {
-      parseDesktopActionAcceptance(await readResponse(await post(fetcher, UPDATE_CHECK_PATH, {})))
+      await native('check-for-updates', () => post(fetcher, UPDATE_CHECK_PATH, {}))
     },
     async exportDiagnostics() {
-      parseDesktopActionAcceptance(await readResponse(await post(fetcher, DIAGNOSTICS_EXPORT_PATH, {})))
+      await native('diagnostics', () => post(fetcher, DIAGNOSTICS_EXPORT_PATH, {}))
     },
   })
 }

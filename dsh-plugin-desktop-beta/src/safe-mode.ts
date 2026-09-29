@@ -5,10 +5,10 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
+import { cleanupDisposableTree } from './disposable-tree.ts'
 import type { DesktopMarketProvider } from './desktop-market.ts'
 import type { DesktopSetupWizardSettings } from './setup-wizard-settings.ts'
 
@@ -25,9 +25,11 @@ export const DESKTOP_SAFE_MODE_PROFILE_NAME = 'desktop-safe-mode'
 
 /** Fixed, disposable preferences used without showing first-run Setup. */
 export const DESKTOP_SAFE_MODE_DEFAULTS: Readonly<{
+  aaEnabled: false
   market: DesktopMarketProvider
   settings: DesktopSetupWizardSettings
 }> = Object.freeze({
+  aaEnabled: false,
   market: 'disabled',
   settings: Object.freeze({
     mode: 'compatibility',
@@ -41,6 +43,8 @@ export const DESKTOP_SAFE_MODE_DEFAULTS: Readonly<{
       notifyOnTurnFailure: false,
       notifyOnJobCompletion: false,
       notifyOnJobFailure: false,
+      notifyOnScheduleCompletion: false,
+      notifyOnScheduleFailure: false,
     }),
   }),
 })
@@ -106,17 +110,10 @@ function validMarker(paths: DesktopSafeModePaths): boolean {
   }
 }
 
-/** Remove only the fixed disposable Safe Mode tree. */
+/** Remove only the disposable tree, unlinking junctions without visiting their targets. */
 export function cleanupDesktopSafeModeEnvironment(userDataDir: string): boolean {
   const paths = desktopSafeModePaths(userDataDir)
-  try {
-    lstatSync(paths.rootDir)
-  } catch (cause) {
-    if ((cause as NodeJS.ErrnoException).code === 'ENOENT') return false
-    throw cause
-  }
-  rmSync(paths.rootDir, { recursive: true, force: true, maxRetries: 3 })
-  return true
+  return cleanupDisposableTree(paths.rootDir)
 }
 
 /** Create a fresh environment and mark it ready only after directory preparation succeeds. */

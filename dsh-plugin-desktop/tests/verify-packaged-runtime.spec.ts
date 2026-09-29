@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -21,13 +22,16 @@ import {
   MAX_PNPM_SMART_UNPACK_FILES,
   MAX_UNPACKED_RUNTIME_BYTES,
   MAX_UNPACKED_RUNTIME_FILES,
+  REQUIRED_AGENT_PRESET_RUNTIME_ENTRIES,
   REQUIRED_DSH_CLI_RUNTIME_ENTRIES,
   REQUIRED_PACKAGED_RUNTIME_ENTRIES,
   REQUIRED_MACOS_UNPACKED_RUNTIME_ENTRIES,
   REQUIRED_MACOS_UNIVERSAL_ENTRIES,
   REQUIRED_NON_MACOS_UNPACKED_RUNTIME_ENTRIES,
+  REQUIRED_POSIX_FS_EXT_ENTRIES,
   REQUIRED_UNPACKED_RUNTIME_ENTRIES,
   REQUIRED_WINDOWS_X64_NODE_PTY_ENTRIES,
+  resolvePackagedApplicationRoot,
   resolvePackagedAsarPath,
   resolvePackagedExecutablePath,
   resolvePackagedUnpackedRoot,
@@ -35,6 +39,7 @@ import {
   smokePackagedElectronRuntime,
   summarizeUnpackedRuntime,
   verifyPackagedRuntime,
+  verifyPackagedAgentsAnywhere,
   verifySelectiveUnpackedRuntime,
   type ArchiveHeaderReader,
   type FileProbe,
@@ -130,6 +135,8 @@ function completeArchiveEntries(): string[] {
     ...DESKTOP_RUNTIME_ENTRIES,
     ...REQUIRED_UNPACKED_RUNTIME_ENTRIES,
     ...REQUIRED_WINDOWS_X64_NODE_PTY_ENTRIES,
+    ...Object.values(REQUIRED_POSIX_FS_EXT_ENTRIES.darwin),
+    ...Object.values(REQUIRED_POSIX_FS_EXT_ENTRIES.linux),
     ...REQUIRED_MACOS_UNIVERSAL_ENTRIES,
   ])]
 }
@@ -139,10 +146,22 @@ function requiredPhysicalEntries(runtimeContext: PackagedRuntimeContext): string
     ? REQUIRED_MACOS_UNPACKED_RUNTIME_ENTRIES
     : REQUIRED_NON_MACOS_UNPACKED_RUNTIME_ENTRIES
   if (runtimeContext.electronPlatformName === 'win32') {
-    return [...desktopAssets, ...REQUIRED_WINDOWS_X64_NODE_PTY_ENTRIES]
+    return [
+      ...desktopAssets,
+      ...REQUIRED_WINDOWS_X64_NODE_PTY_ENTRIES,
+    ]
   }
   if (runtimeContext.electronPlatformName === 'darwin' && runtimeContext.arch === 4) {
     return [...desktopAssets, ...REQUIRED_MACOS_UNIVERSAL_ENTRIES]
+  }
+  if ((runtimeContext.electronPlatformName === 'darwin'
+      || runtimeContext.electronPlatformName === 'linux')
+    && (runtimeContext.arch === 1 || runtimeContext.arch === 3)) {
+    const architecture = runtimeContext.arch === 1 ? 'x64' : 'arm64'
+    return [
+      ...desktopAssets,
+      REQUIRED_POSIX_FS_EXT_ENTRIES[runtimeContext.electronPlatformName][architecture],
+    ]
   }
   return [...desktopAssets]
 }
@@ -181,7 +200,9 @@ describe('packaged desktop runtime verification', () => {
 
   it('tracks every generated DSH CLI chunk without pinning one release hash', () => {
     expect(REQUIRED_DSH_CLI_RUNTIME_ENTRIES).toContain('node_modules/@deepseek-ai/dsh/lib/bin.js')
-    expect(REQUIRED_DSH_CLI_RUNTIME_ENTRIES).toContain('node_modules/@deepseek-ai/dsh/lib/plugin-F7ZVfRyo.js')
+    expect(REQUIRED_DSH_CLI_RUNTIME_ENTRIES).toEqual(expect.arrayContaining([
+      expect.stringMatching(/^node_modules\/@deepseek-ai\/dsh\/lib\/plugin-[^/]+\.js$/u),
+    ]))
     expect(REQUIRED_DSH_CLI_RUNTIME_ENTRIES).not.toContain('node_modules/@deepseek-ai/dsh/lib/plugin-9h8shc4d.js')
   })
 
@@ -191,6 +212,16 @@ describe('packaged desktop runtime verification', () => {
     expect(REQUIRED_PACKAGED_RUNTIME_ENTRIES.some(entry => entry.startsWith('lib/'))).toBe(false)
     expect(DESKTOP_RUNTIME_ENTRIES).toContain('lib/main.js')
     expect(DESKTOP_RUNTIME_ENTRIES).toContain('lib/native-ui/setup-wizard.html')
+  })
+
+  it('keeps the shipped PTC preset present and integrity-protected in app.asar', () => {
+    expect(REQUIRED_AGENT_PRESET_RUNTIME_ENTRIES).toEqual([
+      'node_modules/@deepseek-ai/dsh-web-app/presets/ptc.patch.yml',
+    ])
+    for (const entry of REQUIRED_AGENT_PRESET_RUNTIME_ENTRIES) {
+      expect(REQUIRED_PACKAGED_RUNTIME_ENTRIES).toContain(entry)
+      expect(FORBIDDEN_UNPACKED_RUNTIME_ENTRIES).toContain(entry)
+    }
   })
 
   it('recursively derives every non-map desktop runtime file from the completed build', () => {
@@ -246,9 +277,47 @@ describe('packaged desktop runtime verification', () => {
         expect(received).toBe(summary)
         calls.push('report')
       },
+      () => { calls.push('aa') },
     )
 
-    expect(calls).toEqual(['static', 'report'])
+    expect(calls).toEqual(['static', 'aa', 'report'])
+  })
+
+  it.skipIf(process.platform === 'win32')('rejects a 0644 packaged uv before signing', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-packaged-uv-'))
+    try {
+      const base = context(root, 'darwin', 4)
+      const target: PackagedRuntimeContext = {
+        ...base, packager: { ...base.packager, platformSpecificBuildOptions: { asar: false } },
+      }
+      const files = ['arm64', 'x64'].map(arch => join(
+        resolvePackagedApplicationRoot(target), 'node_modules', '@dataiku', `uv-darwin-${arch}`, 'bin', 'uv',
+      ))
+      for (const path of files) {
+        mkdirSync(join(path, '..'), { recursive: true })
+        writeFileSync(path, 'uv fixture')
+        chmodSync(path, 0o644)
+      }
+      const read = (path: string): Buffer => Buffer.from(path.endsWith('package.json') ? '{"version":"1.0.0"}' : 'same AA')
+      expect(() => verifyPackagedAgentsAnywhere(target, read, read)).toThrow()
+      for (const path of files) chmodSync(path, 0o755)
+      expect(() => verifyPackagedAgentsAnywhere(target, read, read)).not.toThrow()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a stale AA version or entry copied into the installation payload', () => {
+    const installed = (path: string): Buffer => path.endsWith('package.json')
+      ? Buffer.from(JSON.stringify({ version: '0.1.0-dev.desktop.c123' }))
+      : Buffer.from('prepared AA entry')
+    expect(() => verifyPackagedAgentsAnywhere(context('/build', 'win32'), installed, installed)).not.toThrow()
+    expect(() => verifyPackagedAgentsAnywhere(context('/build', 'win32'), installed, path =>
+      path.endsWith('package.json') ? Buffer.from('{"version":"0.1.0-old"}') : installed(path),
+    )).toThrow('Packaged AA version mismatch')
+    expect(() => verifyPackagedAgentsAnywhere(context('/build', 'win32'), installed, path =>
+      path.endsWith('lib/index.js') ? Buffer.from('stale AA entry') : installed(path),
+    )).toThrow('Packaged AA entry differs')
   })
 
   it('tracks ripgrep and the ConPTY native surface required on Windows', () => {
@@ -286,6 +355,26 @@ describe('packaged desktop runtime verification', () => {
     expect(resolvePackagedExecutablePath(runtimeContext)).toBe(expectedExecutable)
     expect(readHeader).toHaveBeenCalledWith(expectedPath)
     expect(listUnpacked).toHaveBeenCalledWith(`${expectedPath}.unpacked`)
+  })
+
+  it.each(['win32', 'darwin', 'linux'] as const)('verifies a plain %s app and refuses an accidental ASAR entry', platform => {
+    const base = context('/build', platform, 1)
+    const runtimeContext: PackagedRuntimeContext = {
+      ...base, packager: { ...base.packager, platformSpecificBuildOptions: { asar: false } },
+    }
+    const appRoot = resolvePackagedApplicationRoot(runtimeContext)
+    const paths = [...new Set([
+      ...REQUIRED_PACKAGED_RUNTIME_ENTRIES, ...DESKTOP_RUNTIME_ENTRIES,
+      ...requiredPhysicalEntries(runtimeContext),
+    ])]
+    const files = paths.map(path => ({ path, bytes: 1 }))
+    const readHeader = vi.fn<ArchiveHeaderReader>(headerReader([]))
+    const exists = (filename: string) => paths.includes(relative(appRoot, filename).replaceAll('\\', '/'))
+    expect(() => verifyPackagedRuntime(runtimeContext, readHeader, exists, () => files)).not.toThrow()
+    expect(readHeader).not.toHaveBeenCalled()
+    expect(() => verifyPackagedRuntime(runtimeContext, readHeader,
+      filename => filename === resolvePackagedAsarPath(runtimeContext) || exists(filename),
+      () => files)).toThrow('unexpectedly contains app.asar')
   })
 
   it('uses LinuxPackager executableName instead of appInfo.productFilename', () => {
@@ -442,6 +531,15 @@ describe('packaged desktop runtime verification', () => {
     },
   )
 
+  it('unpacks AA Python sources while keeping its JavaScript runtime archived', () => {
+    const source = 'node_modules/@agents-anywhere/dsh-bridge-next/lib/bundled-connector/connector/cli.py'
+    expect(() => verifySelectiveUnpackedRuntime(asarIndex([source]), '/build/resources/app.asar.unpacked',
+      [{ path: source, bytes: 100 }])).not.toThrow()
+    const host = 'node_modules/@agents-anywhere/dsh-bridge-next/lib/index.js'
+    expect(() => verifySelectiveUnpackedRuntime(asarIndex([host]), '/build/resources/app.asar.unpacked',
+      [{ path: host, bytes: 100 }])).toThrow('non-allowlisted package roots')
+  })
+
   it('rejects a new smart-unpacked package until its native root is reviewed', () => {
     const path = 'node_modules/unexpected-native/binding.node'
     expect(() => verifySelectiveUnpackedRuntime(
@@ -463,7 +561,10 @@ describe('packaged desktop runtime verification', () => {
   it('requires only the platform-specific nativeImage asset set', () => {
     const mac = context('/build', 'darwin', 3)
     const windows = context('/build', 'win32', 1)
-    expect(requiredPhysicalEntries(mac)).toEqual(REQUIRED_MACOS_UNPACKED_RUNTIME_ENTRIES)
+    expect(requiredPhysicalEntries(mac)).toEqual([
+      ...REQUIRED_MACOS_UNPACKED_RUNTIME_ENTRIES,
+      REQUIRED_POSIX_FS_EXT_ENTRIES.darwin.arm64,
+    ])
     expect(requiredPhysicalEntries(windows)).toEqual([
       ...REQUIRED_NON_MACOS_UNPACKED_RUNTIME_ENTRIES,
       ...REQUIRED_WINDOWS_X64_NODE_PTY_ENTRIES,
@@ -507,6 +608,7 @@ describe('packaged desktop runtime verification', () => {
   })
 
   it('keeps the reviewed smart-unpack surface explicit', () => {
+    expect(ALLOWED_SMART_UNPACK_PACKAGE_ROOTS).toContain('node_modules/fs-ext')
     expect(ALLOWED_SMART_UNPACK_PACKAGE_ROOTS).toContain('node_modules/node-pty')
     expect(ALLOWED_SMART_UNPACK_PACKAGE_ROOTS).toContain('node_modules/pnpm')
     expect(ALLOWED_SMART_UNPACK_PACKAGE_PREFIXES).toContain('node_modules/@vscode/ripgrep-')
@@ -592,6 +694,7 @@ describe('packaged desktop runtime verification', () => {
     'lib/packaged-runtime-smoke.js',
     'lib/pnpm.js',
     'lib/update-download.js',
+    ...REQUIRED_AGENT_PRESET_RUNTIME_ENTRIES,
     'node_modules/open/index.js',
   ])('fails loud when required ASAR entry %s is absent', (missing) => {
     const runtimeContext = context('/build', 'win32')
@@ -627,6 +730,24 @@ describe('packaged desktop runtime verification', () => {
   it('requires the macOS Retina template asset', () => {
     const runtimeContext = context('/build', 'darwin', 3)
     const missing = 'build/tray-iconTemplate@2x.png'
+    const fixture = physicalFixture(runtimeContext, { missing })
+    expect(() => verifyPackagedRuntime(
+      runtimeContext,
+      headerReader(completeArchiveEntries(), requiredPhysicalEntries(runtimeContext)),
+      fixture.exists,
+      () => fixture.files,
+    )).toThrow(`missing required physical entries: ${missing}`)
+  })
+
+  it.each([
+    ['darwin', 1, REQUIRED_POSIX_FS_EXT_ENTRIES.darwin.x64],
+    ['darwin', 3, REQUIRED_POSIX_FS_EXT_ENTRIES.darwin.arm64],
+    ['linux', 1, REQUIRED_POSIX_FS_EXT_ENTRIES.linux.x64],
+    ['linux', 3, REQUIRED_POSIX_FS_EXT_ENTRIES.linux.arm64],
+  ] as const)('requires the %s architecture %s fs-ext binding', (platform, arch, missing) => {
+    const runtimeContext = context('/build', platform, arch, platform === 'linux'
+      ? 'dsh-plugin-desktop'
+      : undefined)
     const fixture = physicalFixture(runtimeContext, { missing })
     expect(() => verifyPackagedRuntime(
       runtimeContext,
@@ -708,5 +829,28 @@ describe('packaged desktop runtime verification', () => {
 
     expect(() => smokePackagedElectronRuntime(context('/build', process.platform), run))
       .toThrow('status null; signal=SIGTERM')
+  })
+
+  // `prepare-fs-ext.ts` names its output after the ABI of whichever Electron is
+  // actually installed (`electron.abi${abi}.node`), but the manifests above spell that
+  // number out. Bumping the Electron pin across an ABI boundary therefore makes the two
+  // disagree, and nothing fails until a packaging job goes looking for a file that was
+  // never built — on macOS that surfaced only as "universal macOS runtime is missing 2
+  // native file(s)" at the very end of a 14-minute job. Reading electron's own
+  // `abi_version` here turns that into an immediate, every-platform unit failure.
+  it('pins fs-ext ABI manifests to the ABI of the installed Electron', () => {
+    const abi = readFileSync(
+      fileURLToPath(new URL('../node_modules/electron/abi_version', import.meta.url)),
+      'utf8',
+    ).trim()
+    expect(abi).toMatch(/^\d+$/)
+
+    const manifestPaths = [
+      ...Object.values(REQUIRED_POSIX_FS_EXT_ENTRIES).flatMap(byArch => Object.values(byArch)),
+      ...REQUIRED_MACOS_UNIVERSAL_ENTRIES,
+    ].filter(path => path.includes('/fs-ext/'))
+
+    expect(manifestPaths.length).toBeGreaterThan(0)
+    expect(manifestPaths.filter(path => !path.endsWith(`/electron.abi${abi}.node`))).toEqual([])
   })
 })

@@ -1,9 +1,15 @@
 /** Recoverable factory reset for the active Desktop-owned DSH data directory. */
 
 import { lstatSync } from 'node:fs'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readdir } from 'node:fs/promises'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import { DESKTOP_PACKAGE_NAME } from './product-identity.ts'
+import { clearDesktopProfilePreferences } from './profile-preferences.ts'
+import { clearDesktopProfileCheckpoint } from './profile-checkpoint.ts'
+import { clearDesktopSetupWizardState } from './setup-wizard-state.ts'
+import { selectDesktopMarketProvider } from './desktop-market.ts'
+import { clearDesktopProfilePluginState } from './desktop-plugins.ts'
+import { assertDesktopProfileName } from './profile-manager.ts'
 
 const DIRECTORY_MODE = 0o700
 const MAX_PATH_BYTES = 32 * 1024
@@ -11,10 +17,14 @@ const MAX_PATH_BYTES = 32 * 1024
 export interface DesktopFactoryResetOptions {
   /** Exact active DSH Home selected by the launcher. */
   readonly homeDir: string
+  /** Current edition's Electron user-data directory containing external preferences. */
+  readonly userDataDir: string
   /** Directories that must never be reset or be descendants of the reset root. */
   readonly protectedPaths: readonly string[]
   /** Electron shell.trashItem adapter; injected so the safety boundary is testable. */
   readonly trashItem: (path: string) => Promise<void>
+  /** Clear this exact Profile's first-use evidence in both Desktop editions. */
+  readonly clearProfileUsageHistory?: (profileDir: string) => void
 }
 
 function canonicalPath(value: string, label: string): string {
@@ -75,8 +85,25 @@ export function assertDesktopFactoryResetTarget(
 export async function resetDesktopDataDirectory(
   options: DesktopFactoryResetOptions,
 ): Promise<string> {
-  const target = assertDesktopFactoryResetTarget(options.homeDir, options.protectedPaths)
+  const userDataDir = canonicalPath(options.userDataDir, 'factory-reset user-data directory')
+  const target = assertDesktopFactoryResetTarget(options.homeDir, [...options.protectedPaths, userDataDir])
+  // Startup always recreates desktop, even when it was removed before reset.
+  const profiles = new Set(['desktop', ...await readdir(join(target, 'profiles'))])
   await options.trashItem(target)
+  // Profile identity is path-based, so rebuilding the same Home would otherwise
+  // restore preferences from before reset into the clean settings document.
+  for (const name of profiles) {
+    const profileDir = join(target, 'profiles', name)
+    await clearDesktopProfilePreferences(userDataDir, profileDir)
+    await clearDesktopSetupWizardState(userDataDir, profileDir)
+    clearDesktopProfileCheckpoint(userDataDir, profileDir)
+    // Staging/dependency entries can exist here but cannot own plugin state.
+    try { assertDesktopProfileName(name) } catch { continue }
+    options.clearProfileUsageHistory?.(profileDir)
+    await clearDesktopProfilePluginState(join(userDataDir, 'plugin-management', 'state.json'), name)
+  }
+  // A fresh Profile imports this legacy machine-level selection on first boot.
+  await selectDesktopMarketProvider(userDataDir, 'disabled')
   await mkdir(target, { recursive: false, mode: DIRECTORY_MODE })
   const recreated = lstatSync(target)
   if (!recreated.isDirectory() || recreated.isSymbolicLink()) {

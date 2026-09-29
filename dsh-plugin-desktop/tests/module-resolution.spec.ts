@@ -111,6 +111,20 @@ describe('installProfilePackageResolver', () => {
     for (const release of releases.splice(0).reverse()) release()
   })
 
+  it.each(['node:fs', 'fs', 'node:path', 'path'])('passes builtin %s through without inspecting the parent filesystem', specifier => {
+    installProfilePackageResolver('file:///profiles/desktop/package.json')
+    harness.realpathNative.mockClear()
+    const parent = join(tmpdir(), 'untracked-plugin', 'index.js')
+    const context = { parentURL: pathToFileURL(parent).href }
+    const result = { url: specifier }
+    const nextResolve = vi.fn(() => result)
+    expect(harness.resolve?.(specifier, context, nextResolve)).toBe(result)
+    expect(nextResolve).toHaveBeenCalledExactlyOnceWith(specifier, context)
+    expect(harness.cjsModule._resolveFilename(specifier, { filename: parent }, false)).toBe(`ordinary:${specifier}`)
+    expect(harness.realpathNative).not.toHaveBeenCalled()
+    expect(harness.overlay).not.toHaveBeenCalled()
+  })
+
   it('uses the overlay-selected side for every Loader package and subpath', () => {
     const profileBaseUrl = 'file:///C:/Users/test/profile/package.json'
     harness.sources.set('@deepseek-ai/dsh-web-app', 'install')
@@ -284,6 +298,32 @@ describe('installProfilePackageResolver', () => {
     expect(harness.realpathNative).toHaveBeenCalledTimes(1)
     expect(harness.realpathNative).toHaveBeenCalledWith(aliasConfig)
     expect(harness.overlay).toHaveBeenCalledTimes(1)
+  })
+
+  it('reuses canonical URL identities, preserves query/hash, and invalidates them on HMR', () => {
+    const profileDirectory = join(tmpdir(), 'dsh-url-cache')
+    const profileBaseUrl = pathToFileURL(join(profileDirectory, 'package.json')).href
+    const alias = join(tmpdir(), 'dsh-url-cache-alias', 'cordis.yml')
+    const aliasUrl = pathToFileURL(alias).href + '?rev=1#entry'
+    let target = join(profileDirectory, 'cordis.yml')
+    installProfilePackageResolver(profileBaseUrl)
+    harness.realpathNative.mockImplementation(candidate => candidate === alias ? target : candidate)
+    const state = (globalThis as unknown as Record<PropertyKey, unknown>)[
+      Symbol.for('dsh-plugin-desktop.profile-package-resolver.v1')
+    ] as { registrations: Map<string, { canonicalPaths: Map<string, string>, canonicalModuleKeys: Map<string, string> }> }
+    const registration = state.registrations.get(profileBaseUrl)!
+    const getPath = vi.spyOn(registration.canonicalPaths, 'get')
+    const nextResolve = vi.fn(() => ({ url: 'node:fs' }))
+    for (let index = 0; index < 100; index += 1) {
+      harness.resolve?.('plugin', { parentURL: aliasUrl }, nextResolve)
+    }
+    expect(getPath.mock.calls.filter(([path]) => path === alias)).toHaveLength(1)
+    expect(registration.canonicalModuleKeys.get(aliasUrl)).toBe(pathToFileURL(target).href + '?rev=1#entry')
+    target = join(profileDirectory, 'next.yml')
+    installProfilePackageResolver(profileBaseUrl)
+    expect(registration.canonicalModuleKeys.size).toBe(0)
+    harness.resolve?.('plugin', { parentURL: aliasUrl }, nextResolve)
+    expect(registration.canonicalModuleKeys.get(aliasUrl)).toBe(pathToFileURL(target).href + '?rev=1#entry')
   })
 
   it('does not cache a failed canonical lookup before an aliased Profile file appears', () => {
@@ -542,6 +582,7 @@ describe('installProfilePackageResolver', () => {
     const registration = state.registrations.get(profileBaseUrl)
     if (registration === undefined) throw new Error('missing test resolver registration')
     delete registration.canonicalPaths
+    delete registration.canonicalModuleKeys
     delete registration.overlayCandidates
     delete registration.activeSequences
 

@@ -48,19 +48,22 @@ const notifications = Object.freeze({
   notifyOnTurnFailure: false,
   notifyOnJobCompletion: true,
   notifyOnJobFailure: false,
+  notifyOnScheduleCompletion: false,
+  notifyOnScheduleFailure: false,
 })
 
 function input(overrides: Partial<DesktopSetupWizardInput> = {}): DesktopSetupWizardInput {
   return {
+    appVersion: '2.0.6-beta.1',
     profileName: 'work',
     platform: 'win32',
-    micaSupported: true,
     mode: 'compatibility',
     macosMaterial: 'transparent',
-    windowsMaterial: 'mica',
+    windowsMaterial: 'off',
     openBrowser: true,
     networkExposure: 'loopback',
-    market: 'community-market',
+    aaEnabled: false,
+  market: 'community-market',
     notifications,
     ...overrides,
   }
@@ -74,11 +77,14 @@ function completeUrl(selection: DesktopSetupWizardSelection = input()): string {
   url.searchParams.set('openBrowser', String(selection.openBrowser))
   url.searchParams.set('networkExposure', selection.networkExposure)
   url.searchParams.set('market', selection.market)
+  url.searchParams.set('aaEnabled', String(selection.aaEnabled === true))
   url.searchParams.set('notificationsEnabled', String(selection.notifications.enabled))
   url.searchParams.set('notifyOnTurnCompletion', String(selection.notifications.notifyOnTurnCompletion))
   url.searchParams.set('notifyOnTurnFailure', String(selection.notifications.notifyOnTurnFailure))
   url.searchParams.set('notifyOnJobCompletion', String(selection.notifications.notifyOnJobCompletion))
   url.searchParams.set('notifyOnJobFailure', String(selection.notifications.notifyOnJobFailure))
+  url.searchParams.set('notifyOnScheduleCompletion', String(selection.notifications.notifyOnScheduleCompletion))
+  url.searchParams.set('notifyOnScheduleFailure', String(selection.notifications.notifyOnScheduleFailure))
   return url.href
 }
 
@@ -96,10 +102,11 @@ describe('Desktop Setup Wizard action parser', () => {
       selection: {
         mode: 'compatibility',
         macosMaterial: 'transparent',
-        windowsMaterial: 'mica',
+        windowsMaterial: 'off',
         openBrowser: true,
         networkExposure: 'loopback',
-        market: 'community-market',
+        aaEnabled: false,
+  market: 'community-market',
         notifications,
       },
     })
@@ -121,6 +128,10 @@ describe('Desktop Setup Wizard action parser', () => {
     const malformed = new URL(completeUrl())
     malformed.searchParams.set('openBrowser', '1')
     expect(parseDesktopSetupWizardAction(malformed.href)).toBeUndefined()
+    // Windows no longer offers Mica, so a stale page cannot select it.
+    const removedMaterial = new URL(completeUrl())
+    removedMaterial.searchParams.set('windowsMaterial', 'mica')
+    expect(parseDesktopSetupWizardAction(removedMaterial.href)).toBeUndefined()
     expect(parseDesktopSetupWizardAction(`${completeUrl()}${'x'.repeat(8192)}`)).toBeUndefined()
   })
 })
@@ -194,6 +205,7 @@ describe('DesktopSetupWizardWindow', () => {
       windowsMaterial: source.windowsMaterial,
       openBrowser: source.openBrowser,
       networkExposure: source.networkExposure,
+      aaEnabled: false,
       market: source.market,
       notifications: source.notifications,
     }
@@ -217,7 +229,7 @@ describe('DesktopSetupWizardWindow', () => {
   })
 
   it('ignores selections unavailable for the supplied platform capabilities', async () => {
-    const linuxInput = input({ platform: 'linux', micaSupported: false, mode: 'compatibility' })
+    const linuxInput = input({ platform: 'linux', mode: 'compatibility' })
     const result = new DesktopSetupWizardWindow({ locale: 'en', input: linuxInput }).run()
     await vi.waitFor(() => { expect(electron.windows).toHaveLength(1) })
     navigate(electron.windows[0]!, completeUrl({ ...linuxInput, mode: 'advanced' }))

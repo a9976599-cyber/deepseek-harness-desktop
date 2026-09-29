@@ -8,9 +8,9 @@ import DesktopSettingsController, {
 import {
   handleDesktopDeveloperToolsToggleRequest,
   handleDesktopDiagnosticsExportRequest,
+  handleDesktopAaSelectRequest,
   handleDesktopMarketSelectRequest,
   handleDesktopProfileCreateRequest,
-  handleDesktopProfileCreateWindowRequest,
   handleDesktopProfileDeleteRequest,
   handleDesktopProfileSelectRequest,
   handleDesktopRecoveryRestartRequest,
@@ -83,7 +83,6 @@ function bootstrap(overrides: DesktopSettingsControllerBootstrapOverrides = {}):
     reloadRenderer: () => {},
     toggleDeveloperTools: () => {},
     exportDiagnostics: async () => {},
-    openProfileCreator: () => {},
     ...overrides,
     profiles: {
       current: { name: DESKTOP.name, dir: DESKTOP.dir },
@@ -149,6 +148,38 @@ function response(): ServerResponse & {
   return res as unknown as ServerResponse & typeof res
 }
 
+describe('AA selection', () => {
+  it('persists before acknowledging and restarts only after the response', async () => {
+    let requested = false
+    const restart = vi.fn()
+    const controller = new DesktopSettingsController(bootstrap({
+      readAa: () => ({ requested, effective: false }),
+      selectAa: async enabled => { requested = enabled }, scheduleRestart: restart,
+    }))
+    const operation = await controller.selectAa(true)
+    expect(requested).toBe(true)
+    expect(controller.read().aa).toEqual({ requested: true, effective: false })
+    expect(operation.response.restartRequired).toBe(true)
+    expect(restart).not.toHaveBeenCalled()
+    await operation.afterResponse?.()
+    expect(restart).toHaveBeenCalledOnce()
+  })
+  it('rejects forged bodies and cross-origin writes', async () => {
+    const selectAa = vi.fn(async () => {})
+    const controller = new DesktopSettingsController(bootstrap({ selectAa,
+      readAa: () => ({ requested: false, effective: false }) }))
+    for (const body of [{ enabled: 'true' }, { enabled: true, extra: true }, {}]) {
+      const res = response()
+      await handleDesktopAaSelectRequest(jsonRequest(body), res, ORIGIN, controller)
+      expect(res.statusCode).toBe(400)
+    }
+    const res = response()
+    await handleDesktopAaSelectRequest(jsonRequest({ enabled: true }, { headers: { origin: 'https://example.com' } }), res, ORIGIN, controller)
+    expect(res.statusCode).toBe(403)
+    expect(selectAa).not.toHaveBeenCalled()
+  })
+})
+
 describe('desktop settings controller', () => {
   it('projects profiles without paths, bundles, or parser diagnostics', () => {
     const controller = new DesktopSettingsController(bootstrap())
@@ -160,6 +191,7 @@ describe('desktop settings controller', () => {
         { name: 'work', exists: true, webCapable: true, selectable: true, deletable: false },
         { name: 'broken', exists: true, webCapable: false, selectable: false, deletable: false },
       ],
+      aa: { requested: false, effective: false },
       market: { requested: 'disabled', effective: 'disabled', legacyDefaulted: false },
       web: {
         localUrl: 'http://127.0.0.1:43120/',
@@ -194,6 +226,7 @@ describe('desktop settings controller', () => {
         { name: 'desktop', exists: true, webCapable: true, selectable: true, deletable: false },
         { name: 'work', exists: true, webCapable: true, selectable: true, deletable: false },
       ],
+      aa: { requested: false, effective: false },
       market: { requested: 'disabled', effective: 'disabled', legacyDefaulted: false },
       web: {
         localUrl: 'http://127.0.0.1:43120/',
@@ -227,6 +260,7 @@ describe('desktop settings controller', () => {
         { name: 'desktop', exists: true, webCapable: true, selectable: true, deletable: false },
         { name: 'work', exists: true, webCapable: true, selectable: true, deletable: true },
       ],
+      aa: { requested: false, effective: false },
       market: { requested: 'disabled', effective: 'disabled', legacyDefaulted: false },
       web: {
         localUrl: 'http://127.0.0.1:43120/',
@@ -356,18 +390,14 @@ describe('desktop settings controller', () => {
     expect(toggleDeveloperTools).toHaveBeenCalledOnce()
   })
 
-  it('hands native diagnostics and Profile creation to launcher capabilities', async () => {
+  it('hands diagnostics export to the launcher capability', async () => {
     const exportDiagnostics = vi.fn(async () => {})
-    const openProfileCreator = vi.fn()
     const controller = new DesktopSettingsController(bootstrap({
       exportDiagnostics,
-      openProfileCreator,
     }))
 
     await expect(controller.exportDiagnostics()).resolves.toEqual({ accepted: true })
-    expect(controller.openProfileCreator()).toEqual({ accepted: true })
     expect(exportDiagnostics).toHaveBeenCalledOnce()
-    expect(openProfileCreator).toHaveBeenCalledOnce()
   })
 })
 
@@ -424,6 +454,7 @@ describe('desktop settings HTTP boundary', () => {
         { name: 'desktop', exists: true, webCapable: true, selectable: true, deletable: false },
         { name: 'work', exists: true, webCapable: true, selectable: true, deletable: false },
       ],
+      aa: { requested: false, effective: false },
       market: { requested: 'disabled', effective: 'disabled', legacyDefaulted: false },
       web: {
         localUrl: 'http://127.0.0.1:43120/',
@@ -706,23 +737,17 @@ describe('desktop settings HTTP boundary', () => {
     expect(toggleDeveloperTools).toHaveBeenCalledOnce()
   })
 
-  it('exports diagnostics and opens the native creator', async () => {
+  it('exports diagnostics', async () => {
     const exportDiagnostics = vi.fn(async () => {})
-    const openProfileCreator = vi.fn()
     const controller = new DesktopSettingsController(bootstrap({
       exportDiagnostics,
-      openProfileCreator,
     }))
     const diagnosticResponse = response()
-    const creatorResponse = response()
 
     await handleDesktopDiagnosticsExportRequest(jsonRequest({}), diagnosticResponse, ORIGIN, controller)
-    await handleDesktopProfileCreateWindowRequest(jsonRequest({}), creatorResponse, ORIGIN, controller)
 
     expect(diagnosticResponse.statusCode).toBe(200)
-    expect(creatorResponse.statusCode).toBe(200)
     expect(exportDiagnostics).toHaveBeenCalledOnce()
-    expect(openProfileCreator).toHaveBeenCalledOnce()
   })
 
   it('reports terminal launch failures without exposing the native cause', async () => {

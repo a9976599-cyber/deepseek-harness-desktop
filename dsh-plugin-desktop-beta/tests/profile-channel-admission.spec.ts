@@ -12,12 +12,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   clearDesktopProfileUsageHistory,
   desktopReleaseUserDataLocations,
+  hasDesktopProfileUsageHistory,
   inspectDesktopProfileChannelAdmission,
   type DesktopReleaseUserData,
 } from '../src/profile-channel-admission.ts'
 import { DesktopProfileCheckpoint } from '../src/profile-checkpoint.ts'
 import {
   completeOrSkipDesktopSetupWizard,
+  desktopSetupWizardStatePath,
   readDesktopSetupWizardState,
 } from '../src/setup-wizard-state.ts'
 import {
@@ -72,7 +74,7 @@ async function recordSetup(
   recordedAt: string,
 ): Promise<void> {
   await completeOrSkipDesktopSetupWizard(release.userDataDir, target.profile, 'completed', {
-    desktopVersion: release.identity.releaseChannel === 'stable' ? '2.0.4' : '2.0.5-beta.2',
+    desktopVersion: release.identity.releaseChannel === 'stable' ? '2.0.4' : '2.0.6-beta.1',
     dshVersion: '0.1.2-rc.1',
     setupRevision: 1,
   }, recordedAt)
@@ -83,6 +85,49 @@ afterEach(() => {
 })
 
 describe('Desktop Profile release-channel admission', () => {
+  it('requires a genuinely unused Profile, not just an existing directory or another Profile history', async () => {
+    const target = fixture()
+    expect(hasDesktopProfileUsageHistory(target.locations, target.profile, 'work')).toBe(false)
+    await completeOrSkipDesktopSetupWizard(target.currentUserData, join(target.home, 'profiles', 'other'), 'completed', {
+      desktopVersion: '1.0.0', dshVersion: '0.1.0', setupRevision: 1,
+    })
+    expect(hasDesktopProfileUsageHistory(target.locations, target.profile, 'work')).toBe(false)
+  })
+
+  it.each(['current', 'other'] as const)('honors completed, skipped, and legacy Setup in the %s edition without rewriting evidence', async side => {
+    const target = fixture()
+    const release = target.locations[side]
+    for (const outcome of ['completed', 'skipped'] as const) {
+      const state = await completeOrSkipDesktopSetupWizard(release.userDataDir, target.profile, outcome, {
+        desktopVersion: '1.0.0-beta.1', dshVersion: '0.1.0', setupRevision: 1,
+      })
+      const path = desktopSetupWizardStatePath(release.userDataDir, target.profile)
+      const original = readFileSync(path, 'utf8')
+      expect(hasDesktopProfileUsageHistory(target.locations, target.profile, 'work')).toBe(true)
+      expect(readFileSync(path, 'utf8')).toBe(original)
+      writeFileSync(path, JSON.stringify({ version: 1, profileHash: state.profileHash, outcome }))
+      expect(hasDesktopProfileUsageHistory(target.locations, target.profile, 'work')).toBe(true)
+    }
+  })
+
+  it.each(['current', 'other'] as const)('recognizes older successful launches without Setup markers in the %s edition', side => {
+    const target = fixture()
+    capture(target, target.locations[side], '2026-09-02T01:00:00.000Z', '1.0.0')
+    expect(readDesktopSetupWizardState(target.locations[side].userDataDir, target.profile)).toBeUndefined()
+    expect(hasDesktopProfileUsageHistory(target.locations, target.profile, 'work')).toBe(true)
+    clearDesktopProfileUsageHistory(target.locations, target.profile)
+    expect(hasDesktopProfileUsageHistory(target.locations, target.profile, 'work')).toBe(false)
+  })
+
+  it('does not mistake corrupt history for first use, but accepts valid evidence from the other edition', async () => {
+    const target = fixture()
+    const path = capture(target, target.locations.current, '2026-09-02T01:00:00.000Z')
+    writeFileSync(path, '{broken')
+    expect(() => hasDesktopProfileUsageHistory(target.locations, target.profile, 'work')).toThrow()
+    await recordSetup(target, target.locations.other, '2026-09-02T01:00:00.000Z')
+    expect(hasDesktopProfileUsageHistory(target.locations, target.profile, 'work')).toBe(true)
+  })
+
   it('uses the real current userData and the other product canonical directory', () => {
     const target = fixture()
     expect(target.locations.current).toEqual({

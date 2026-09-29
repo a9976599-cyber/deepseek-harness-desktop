@@ -1,6 +1,6 @@
 /** Host-independent Electron recovery window for profile startup failures. */
 
-import { app, screen, shell, type BrowserWindow } from 'electron'
+import { app, dialog, screen, shell, type BrowserWindow } from 'electron'
 import { execFile } from 'node:child_process'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname } from 'node:path'
@@ -23,6 +23,7 @@ import {
   DesktopStartupRecoveryController,
   DesktopStartupRecoveryControllerError,
   type DesktopStartupRecoveryCheckpointPreview,
+  type DesktopStartupRecoverySelectionPreview,
   type DesktopStartupRecoveryUninstallPreview,
   type DesktopStartupRecoverySnapshot,
 } from './startup-recovery-controller.ts'
@@ -65,6 +66,8 @@ export interface DesktopStartupRecoveryWindowOptions {
   readonly openTerminal?: () => void | Promise<void>
   /** Main-process validated actions available from the failure generation. */
   readonly profileActions?: DesktopStartupRecoveryProfileActions
+  /** Launcher-owned DSH Home mutation capabilities, absent before path resolution or in Safe Mode. */
+  readonly dataActions?: DesktopStartupRecoveryDataActions
   /** Prepare a fresh isolated environment before a Safe Mode relaunch. */
   readonly enterSafeMode?: () => void | Promise<void>
   /** True when this process already uses the disposable Safe Mode environment. */
@@ -84,6 +87,26 @@ export interface DesktopStartupRecoveryProfileActions {
   readonly switchProfile: (name: string, token: string) => void | Promise<void>
   /** Open the isolated native creator; it accepts no filesystem path. */
   readonly openCreator: () => void | Promise<void>
+}
+
+export interface DesktopStartupRecoveryDataActions {
+  /** Exact active DSH Home shown to the user and used by every selection check. */
+  readonly currentDirectory: string
+  readonly usingDefaultDirectory: boolean
+  /** Re-check the platform-default DSH Home at click time so confirmation copy matches the action. */
+  readonly defaultDirectoryMissing: () => boolean
+  /** Select an empty or existing valid DSH Home without changing the current directory. */
+  readonly changeDirectory: (
+    targetDirectory: string,
+    signal: AbortSignal,
+  ) => Promise<void>
+  /** Select the platform default; creation is allowed only after the missing-directory confirmation. */
+  readonly restoreDefaultDirectory: (
+    signal: AbortSignal,
+    createIfMissing: boolean,
+  ) => Promise<void>
+  /** Move the exact active DSH Home to the operating-system trash and recreate an empty root. */
+  readonly resetDirectory: () => Promise<void>
 }
 
 export interface DesktopStartupRecoveryConfigurationPaths {
@@ -171,6 +194,13 @@ export interface DesktopStartupRecoveryViewModel {
   readonly restartReady: boolean
   readonly activeTab: DesktopRecoveryTab
   readonly configurationAvailable: boolean
+  readonly profileDirectory?: string
+  readonly dataDirectory?: {
+    readonly currentDirectory: string
+    readonly usingDefaultDirectory: boolean
+    readonly editing: boolean
+    readonly draftDirectory?: string
+  }
   readonly profiles?: readonly DesktopStartupRecoveryProfile[]
   readonly profileActionToken?: string
   readonly terminalAvailable?: boolean
@@ -182,7 +212,7 @@ export interface DesktopStartupRecoveryViewModel {
 /** Parse only the fixed action origin used by the local shadcn recovery document. */
 export function parseDesktopStartupRecoveryAction(
   href: string,
-): { readonly action: string; readonly id?: string; readonly name?: string } | undefined {
+): { readonly action: string; readonly id?: string; readonly name?: string; readonly path?: string } | undefined {
   let url: URL
   try { url = new URL(href) } catch { return undefined }
   if (url.protocol !== RECOVERY_SCHEME
@@ -194,6 +224,8 @@ export function parseDesktopStartupRecoveryAction(
   const action = url.hostname
   const allowed = new Set([
     'preview-uninstall',
+    'preview-disable',
+    'preview-enable',
     'preview-checkpoint',
     'open-checkpoint',
     'export-diagnostics',
@@ -205,13 +237,22 @@ export function parseDesktopStartupRecoveryAction(
     'open-terminal',
     'open-profile-creator',
     'enter-safe-mode',
+    'begin-change-data-directory',
+    'restore-default-data-directory',
+    'cancel-change-data-directory',
+    'browse-data-directory',
+    'apply-data-directory',
+    'factory-reset',
     'switch-profile',
     'restart',
     'quit',
   ])
   if (!allowed.has(action)) return undefined
   const keys = [...url.searchParams.keys()]
-  if (keys.some(key => key !== 'id' && key !== 'name') || url.searchParams.getAll('id').length > 1 || url.searchParams.getAll('name').length > 1) return undefined
+  if (keys.some(key => key !== 'id' && key !== 'name' && key !== 'path')
+    || url.searchParams.getAll('id').length > 1
+    || url.searchParams.getAll('name').length > 1
+    || url.searchParams.getAll('path').length > 1) return undefined
   const id = url.searchParams.get('id') ?? undefined
   const needsId = action.startsWith('preview-') || action === 'switch-profile' || action === 'open-checkpoint'
   if (needsId !== (id !== undefined)) return undefined
@@ -222,7 +263,17 @@ export function parseDesktopStartupRecoveryAction(
   if (action === 'switch-profile') {
     if (name === undefined || name.length === 0 || Buffer.byteLength(name, 'utf8') > 255 || name.includes('/') || name.includes('\\') || /[\0\r\n]/u.test(name)) return undefined
   } else if (name !== undefined) return undefined
-  return { action, ...(id === undefined ? {} : { id }), ...(name === undefined ? {} : { name }) }
+  const path = url.searchParams.get('path') ?? undefined
+  if (action === 'apply-data-directory') {
+    if (path === undefined || path.trim().length === 0 || path.includes('\0')
+      || /[\r\n]/u.test(path) || Buffer.byteLength(path, 'utf8') > 32 * 1024) return undefined
+  } else if (path !== undefined) return undefined
+  return {
+    action,
+    ...(id === undefined ? {} : { id }),
+    ...(name === undefined ? {} : { name }),
+    ...(path === undefined ? {} : { path }),
+  }
 }
 
 /** One native recovery window whose renderer has no Node, IPC, or network capability. */
@@ -238,10 +289,12 @@ export class DesktopStartupRecoveryWindow {
   private busy = false
   private restartReady = false
   private activeTab: DesktopRecoveryTab = 'quick'
+  private dataDirectoryEditing = false
+  private dataDirectoryDraft: string | undefined
+  private readonly dataActionAbort = new AbortController()
   private profiles: readonly DesktopStartupRecoveryProfile[] | undefined
   private resolveResult: ((result: RecoveryWindowResult) => void) | undefined
   private settled = false
-  private renderTail: Promise<void> = Promise.resolve()
 
   constructor(private readonly options: DesktopStartupRecoveryWindowOptions) {}
 
@@ -301,7 +354,12 @@ export class DesktopStartupRecoveryWindow {
     revealApplication(this.window)
   }
 
-  private async handleAction(action: { readonly action: string; readonly id?: string; readonly name?: string }): Promise<void> {
+  private async handleAction(action: {
+    readonly action: string
+    readonly id?: string
+    readonly name?: string
+    readonly path?: string
+  }): Promise<void> {
     if (this.busy || this.settled) return
     const copy = desktopRecoveryCopy(this.options.locale)
     try {
@@ -315,6 +373,28 @@ export class DesktopStartupRecoveryWindow {
               tone: 'success',
               title: result.packageName,
               body: copy.uninstalledSuccess,
+            }
+            this.restartReady = true
+            await this.refreshSnapshot()
+          })
+        }
+      } else if ((action.action === 'preview-disable' || action.action === 'preview-enable')
+        && action.id !== undefined) {
+        this.activeTab = 'plugins'
+        const kind = action.action === 'preview-disable' ? 'disable' : 'enable'
+        const controller = this.requireController()
+        const preview = kind === 'disable'
+          ? await controller.previewDisable(action.id)
+          : await controller.previewEnable(action.id)
+        if (await this.confirmRecoveryAction(kind, preview)) {
+          await this.runBusy(async () => {
+            const result = kind === 'disable'
+              ? await this.requireController().executeDisable(preview.previewId)
+              : await this.requireController().executeEnable(preview.previewId)
+            this.notice = {
+              tone: 'success',
+              title: result.packageName,
+              body: kind === 'disable' ? copy.disabledSuccess : copy.enabledSuccess,
             }
             this.restartReady = true
             await this.refreshSnapshot()
@@ -389,6 +469,70 @@ export class DesktopStartupRecoveryWindow {
           this.finish('safe-mode')
           return
         }
+      } else if (action.action === 'begin-change-data-directory') {
+        this.activeTab = 'data'
+        if (this.options.dataActions === undefined) throw new Error('DSH data management is unavailable for this startup stage.')
+        if (await this.confirmDataDirectoryChange()) {
+          this.dataDirectoryEditing = true
+          this.dataDirectoryDraft = undefined
+        }
+      } else if (action.action === 'restore-default-data-directory') {
+        this.activeTab = 'data'
+        const actions = this.options.dataActions
+        if (actions === undefined) throw new Error('DSH data management is unavailable for this startup stage.')
+        if (actions.usingDefaultDirectory) return
+        const createIfMissing = actions.defaultDirectoryMissing()
+        if (await this.confirmRestoreDefaultDirectory(createIfMissing)) {
+          await this.runBusy(async () => {
+            await actions.restoreDefaultDirectory(this.dataActionAbort.signal, createIfMissing)
+          })
+          this.finish('restart')
+          return
+        }
+      } else if (action.action === 'cancel-change-data-directory') {
+        this.activeTab = 'data'
+        this.dataDirectoryEditing = false
+        this.dataDirectoryDraft = undefined
+      } else if (action.action === 'browse-data-directory') {
+        this.activeTab = 'data'
+        const actions = this.options.dataActions
+        const window = this.window
+        if (actions === undefined || window === undefined || window.isDestroyed()) {
+          throw new Error('DSH data management is unavailable for this startup stage.')
+        }
+        const selected = await dialog.showOpenDialog(window, {
+          title: copy.selectDataDirectory,
+          defaultPath: dirname(actions.currentDirectory),
+          properties: ['openDirectory', 'createDirectory', 'dontAddToRecent'],
+        })
+        if (!selected.canceled && selected.filePaths[0] !== undefined) {
+          this.dataDirectoryEditing = true
+          this.dataDirectoryDraft = selected.filePaths[0]
+        }
+      } else if (action.action === 'apply-data-directory' && action.path !== undefined) {
+        this.activeTab = 'data'
+        const actions = this.options.dataActions
+        if (actions === undefined || !this.dataDirectoryEditing) {
+          throw new Error('DSH data-directory change is not active.')
+        }
+        this.dataDirectoryDraft = action.path.trim()
+        await this.runBusy(async () => {
+          await actions.changeDirectory(
+            this.dataDirectoryDraft ?? '',
+            this.dataActionAbort.signal,
+          )
+        })
+        this.finish('restart')
+        return
+      } else if (action.action === 'factory-reset') {
+        this.activeTab = 'data'
+        const actions = this.options.dataActions
+        if (actions === undefined) throw new Error('DSH data management is unavailable for this startup stage.')
+        if (await this.confirmFactoryReset(actions.currentDirectory)) {
+          await this.runBusy(async () => { await actions.resetDirectory() })
+          this.finish('restart')
+          return
+        }
       } else if (action.action === 'open-settings-document') {
         this.activeTab = 'diagnostics'
         await this.openConfigurationPath('settingsDocument')
@@ -428,8 +572,13 @@ export class DesktopStartupRecoveryWindow {
         title: copy.title,
         body: copy.actionFailed,
       }
-      if (action.action === 'preview-checkpoint' || action.action === 'preview-uninstall') {
+      if (action.action === 'preview-checkpoint' || action.action === 'preview-uninstall'
+        || action.action === 'preview-disable' || action.action === 'preview-enable') {
         await this.showOperationFailure(cause, action.action).catch(() => {})
+      } else if (action.action === 'apply-data-directory'
+        || action.action === 'restore-default-data-directory'
+        || action.action === 'factory-reset') {
+        await this.showDataOperationFailure(cause).catch(() => {})
       }
     }
     await this.render()
@@ -437,13 +586,17 @@ export class DesktopStartupRecoveryWindow {
 
   private async showOperationFailure(
     cause: unknown,
-    action: 'preview-checkpoint' | 'preview-uninstall',
+    action: 'preview-checkpoint' | 'preview-uninstall' | 'preview-disable' | 'preview-enable',
   ): Promise<void> {
     const window = this.window
     if (window === undefined || window.isDestroyed()) return
     const copy = desktopRecoveryCopy(this.options.locale)
     const error = cause instanceof DesktopStartupRecoveryControllerError ? cause : undefined
-    const stage = error?.operationStage ?? 'checkpoint-restore'
+    // A non-controller failure carries no stage, so name the stage the action
+    // itself was in rather than always claiming a checkpoint restore.
+    const stage = error?.operationStage ?? (action === 'preview-checkpoint'
+      ? 'checkpoint-restore'
+      : action === 'preview-uninstall' ? 'plugin-change' : 'bundle-selection')
     const message = error?.message ?? (cause instanceof Error ? cause.message : String(cause))
     const detail = [
       `${copy.operationStage}: ${copy.operationStageLabels[stage]}`,
@@ -456,8 +609,12 @@ export class DesktopStartupRecoveryWindow {
     ].join('\n')
     await showDesktopDialog({
       type: 'error',
-      title: action === 'preview-checkpoint' ? copy.rollbackFailedTitle : copy.uninstallFailedTitle,
-      message: action === 'preview-checkpoint' ? copy.rollbackFailedMessage : copy.uninstallFailedMessage,
+      title: action === 'preview-checkpoint' ? copy.rollbackFailedTitle
+        : action === 'preview-uninstall' ? copy.uninstallFailedTitle
+          : copy.bundleSelectionFailedTitle,
+      message: action === 'preview-checkpoint' ? copy.rollbackFailedMessage
+        : action === 'preview-uninstall' ? copy.uninstallFailedMessage
+          : copy.bundleSelectionFailedMessage,
       detail,
       buttons: [copy.close],
       defaultId: 0,
@@ -467,8 +624,10 @@ export class DesktopStartupRecoveryWindow {
   }
 
   private async confirmRecoveryAction(
-    kind: 'uninstall' | 'checkpoint',
-    preview: DesktopStartupRecoveryUninstallPreview | DesktopStartupRecoveryCheckpointPreview,
+    kind: 'uninstall' | 'checkpoint' | 'disable' | 'enable',
+    preview: DesktopStartupRecoveryUninstallPreview
+      | DesktopStartupRecoverySelectionPreview
+      | DesktopStartupRecoveryCheckpointPreview,
   ): Promise<boolean> {
     const window = this.window
     if (window === undefined || window.isDestroyed()) return false
@@ -480,17 +639,24 @@ export class DesktopStartupRecoveryWindow {
     const checkpointTime = 'capturedAt' in preview && !Number.isNaN(Date.parse(preview.capturedAt))
       ? new Date(preview.capturedAt).toLocaleString(this.options.locale === 'zh' ? 'zh-CN' : 'en-US')
       : copy.unknown
+    // `warning` stays reserved for the one destructive action, so the dialog
+    // tone itself tells a disable apart from an uninstall.
     const result = await showDesktopMessageBox({
       type: kind === 'uninstall' ? 'warning' : 'question',
-      title: kind === 'uninstall'
-        ? copy.confirmUninstall
-        : copy.confirmRollback,
+      title: kind === 'uninstall' ? copy.confirmUninstall
+        : kind === 'disable' ? copy.confirmDisable
+          : kind === 'enable' ? copy.confirmEnable
+            : copy.confirmRollback,
       message,
-      detail: kind === 'uninstall'
-        ? copy.confirmUninstallBody
-        : copy.confirmRollbackBody(checkpointTime),
+      detail: kind === 'uninstall' ? copy.confirmUninstallBody
+        : kind === 'disable' ? copy.confirmDisableBody
+          : kind === 'enable' ? copy.confirmEnableBody
+            : copy.confirmRollbackBody(checkpointTime),
       buttons: [
-        kind === 'uninstall' ? copy.uninstall : copy.confirmRollbackAction,
+        kind === 'uninstall' ? copy.uninstall
+          : kind === 'disable' ? copy.confirmDisableAction
+            : kind === 'enable' ? copy.confirmEnableAction
+              : copy.confirmRollbackAction,
         copy.cancel,
       ],
       defaultId: 1,
@@ -516,14 +682,89 @@ export class DesktopStartupRecoveryWindow {
     }, window)
     return result.response === 0
   }
+
+  private async confirmDataDirectoryChange(): Promise<boolean> {
+    const window = this.window
+    if (window === undefined || window.isDestroyed()) return false
+    const copy = desktopRecoveryCopy(this.options.locale)
+    const result = await showDesktopMessageBox({
+      type: 'question',
+      title: copy.confirmDataDirectoryChange,
+      message: copy.confirmDataDirectoryChangeMessage,
+      detail: copy.confirmDataDirectoryChangeBody,
+      buttons: [copy.continueDataDirectoryChange, copy.cancel],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    }, window)
+    return result.response === 0
+  }
+
+  private async confirmRestoreDefaultDirectory(createIfMissing: boolean): Promise<boolean> {
+    const window = this.window
+    if (window === undefined || window.isDestroyed()) return false
+    const copy = desktopRecoveryCopy(this.options.locale)
+    const result = await showDesktopMessageBox({
+      type: 'question',
+      title: createIfMissing
+        ? copy.confirmCreateDefaultDirectory
+        : copy.confirmRestoreDefaultDirectory,
+      message: createIfMissing
+        ? copy.confirmCreateDefaultDirectoryMessage
+        : copy.confirmRestoreDefaultDirectoryMessage,
+      detail: createIfMissing
+        ? copy.confirmCreateDefaultDirectoryBody
+        : copy.confirmRestoreDefaultDirectoryBody,
+      buttons: [
+        createIfMissing
+          ? copy.confirmCreateDefaultDirectoryAction
+          : copy.confirmRestoreDefaultDirectoryAction,
+        copy.cancel,
+      ],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    }, window)
+    return result.response === 0
+  }
+
+  private async confirmFactoryReset(currentDirectory: string): Promise<boolean> {
+    const window = this.window
+    if (window === undefined || window.isDestroyed()) return false
+    const copy = desktopRecoveryCopy(this.options.locale)
+    const result = await showDesktopMessageBox({
+      type: 'warning',
+      title: copy.confirmFactoryReset,
+      message: copy.confirmFactoryResetMessage,
+      detail: copy.confirmFactoryResetBody(currentDirectory),
+      buttons: [copy.confirmFactoryResetAction, copy.cancel],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    }, window)
+    return result.response === 0
+  }
+
+  private async showDataOperationFailure(cause: unknown): Promise<void> {
+    const window = this.window
+    if (window === undefined || window.isDestroyed()) return
+    const copy = desktopRecoveryCopy(this.options.locale)
+    await showDesktopDialog({
+      type: 'error',
+      title: copy.dataOperationFailedTitle,
+      message: copy.dataOperationFailedMessage,
+      detail: cause instanceof Error ? cause.message : String(cause),
+      buttons: [copy.close],
+      defaultId: 0,
+      cancelId: 0,
+      presentation: 'diagnostic',
+    }, window)
+  }
+
   private async runBusy(operation: () => Promise<void>): Promise<void> {
     this.busy = true
-    try {
-      await this.render()
-      await operation()
-    } finally {
-      this.busy = false
-    }
+    await this.render()
+    try { await operation() } finally { this.busy = false }
   }
 
   private async refreshSnapshot(): Promise<void> {
@@ -587,13 +828,7 @@ export class DesktopStartupRecoveryWindow {
     }
   }
 
-  private render(): Promise<void> {
-    const task = this.renderTail.then(async () => { await this.renderDocument() })
-    this.renderTail = task.catch(() => {})
-    return task
-  }
-
-  private async renderDocument(): Promise<void> {
+  private async render(): Promise<void> {
     const window = this.window
     if (window === undefined || window.isDestroyed()) return
     const notice = this.notice
@@ -610,6 +845,19 @@ export class DesktopStartupRecoveryWindow {
       restartReady: this.restartReady,
       activeTab: this.activeTab,
       configurationAvailable: this.options.configurationPaths !== undefined,
+      ...(this.options.configurationPaths?.profileDirectory === undefined
+        ? {}
+        : { profileDirectory: this.options.configurationPaths.profileDirectory }),
+      ...(this.options.dataActions === undefined
+        ? {}
+        : {
+            dataDirectory: {
+              currentDirectory: this.options.dataActions.currentDirectory,
+              usingDefaultDirectory: this.options.dataActions.usingDefaultDirectory,
+              editing: this.dataDirectoryEditing,
+              ...(this.dataDirectoryDraft === undefined ? {} : { draftDirectory: this.dataDirectoryDraft }),
+            },
+          }),
       ...(this.profiles === undefined ? {} : { profiles: this.profiles }),
       ...(this.options.profileActions === undefined ? {} : { profileActionToken: this.options.profileActions.token }),
       ...(this.options.openTerminal === undefined ? {} : { terminalAvailable: true }),
@@ -633,6 +881,7 @@ export class DesktopStartupRecoveryWindow {
     if (this.settled) return
     this.settled = true
     this.diagnosticAbort.abort(new DOMException('Recovery window closed.', 'AbortError'))
+    this.dataActionAbort.abort(new DOMException('Recovery window closed.', 'AbortError'))
     const window = this.window
     this.window = undefined
     if (window !== undefined && !window.isDestroyed()) window.destroy()

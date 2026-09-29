@@ -4,11 +4,12 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['tests/**/*.spec.ts'],
-    // This patched host package is exercised with a mocked node:fs/promises.
-    // Keep it in Vitest's module graph so the builtin mock reaches its imports.
+    globalSetup: process.platform === 'win32' ? ['../scripts/prepare-test-electron.mjs'] : [],
+    // Keep patched packages in Vitest's module graph so mocks reach their
+    // fs/promises and undici imports instead of using the live filesystem/network.
     server: {
       deps: {
-        inline: ['@deepseek-ai/dsh-host-directory-picker-browse'],
+        inline: ['@deepseek-ai/dsh-host-directory-picker-browse', '@deepseek-ai/dsh-native-command', 'dshmarket'],
       },
     },
     // Profile integration tests create a full package-junction closure; higher

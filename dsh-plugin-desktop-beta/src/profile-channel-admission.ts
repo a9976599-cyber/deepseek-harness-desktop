@@ -118,6 +118,38 @@ export function inspectDesktopReleaseProfileUsage(
   }
 }
 
+/**
+ * Setup is shared by Profile identity across editions, unlike channel admission.
+ * Read legacy completion/skip markers too; their missing version is irrelevant
+ * here. Never stamp a new usage time merely because another edition was used.
+ */
+export function hasDesktopProfileUsageHistory(
+  locations: DesktopReleaseUserDataLocations,
+  profileDir: string,
+  profileName: string,
+): boolean {
+  let problem: Error | undefined
+  for (const release of locations.all) {
+    try {
+      if (readDesktopSetupWizardState(release.userDataDir, profileDir) !== undefined) return true
+    } catch (cause) {
+      problem ??= cause instanceof Error ? cause : new Error(String(cause))
+    }
+    const checkpoint = inspectLatestDesktopProfileCheckpointUsage({
+      userDataDir: release.userDataDir,
+      profileDir,
+      profileName,
+      legacyDesktopPackageName: release.identity.packageName,
+      legacyReleaseChannel: release.identity.releaseChannel,
+    })
+    if (checkpoint.status === 'valid') return true
+    if (checkpoint.status === 'invalid') problem ??= new Error(checkpoint.problem)
+  }
+  // Corruption is not proof that a Profile is new; keep the recovery path.
+  if (problem !== undefined) throw problem
+  return false
+}
+
 /** Decide whether the other Desktop package has the newest trustworthy evidence. */
 export function inspectDesktopProfileChannelAdmission(
   locations: DesktopReleaseUserDataLocations,

@@ -38,6 +38,8 @@ const COMPLETE_KEYS = Object.freeze([
   'notifyOnTurnFailure',
   'notifyOnJobCompletion',
   'notifyOnJobFailure',
+  'notifyOnScheduleCompletion',
+  'notifyOnScheduleFailure',
 ] as const)
 
 export interface DesktopSetupWizardWindowOptions {
@@ -62,7 +64,7 @@ function exactMacosMaterial(value: string | null): DesktopSetupWizardMacosMateri
 }
 
 function exactWindowsMaterial(value: string | null): DesktopSetupWizardWindowsMaterial | undefined {
-  return value === 'off' || value === 'mica' ? value : undefined
+  return value === 'off' ? value : undefined
 }
 
 function exactNetworkExposure(value: string | null): DesktopSetupWizardNetworkExposure | undefined {
@@ -83,8 +85,9 @@ export function parseDesktopSetupWizardAction(
   if (url.protocol !== SETUP_WIZARD_SCHEME
     || url.username !== '' || url.password !== '' || url.port !== ''
     || url.pathname !== '' || url.hash !== '') return undefined
-  const keys = [...url.searchParams.keys()]
-  if (url.hostname === 'skip') return keys.length === 0 ? Object.freeze({ action: 'skip' as const }) : undefined
+  const keys = [...url.searchParams.keys()].filter(key => key !== 'aaEnabled')
+  if (url.searchParams.getAll('aaEnabled').length > 1) return undefined
+  if (url.hostname === 'skip') return url.searchParams.size === 0 ? Object.freeze({ action: 'skip' as const }) : undefined
   if (url.hostname !== 'complete'
     || keys.length !== COMPLETE_KEYS.length
     || keys.some(key => !COMPLETE_KEYS.includes(key as typeof COMPLETE_KEYS[number]))
@@ -95,17 +98,21 @@ export function parseDesktopSetupWizardAction(
   const windowsMaterial = exactWindowsMaterial(url.searchParams.get('windowsMaterial'))
   const openBrowser = exactBoolean(url.searchParams.get('openBrowser'))
   const networkExposure = exactNetworkExposure(url.searchParams.get('networkExposure'))
+  const aaEnabled = url.searchParams.has('aaEnabled') ? exactBoolean(url.searchParams.get('aaEnabled')) : false
   const market = exactMarket(url.searchParams.get('market'))
   const enabled = exactBoolean(url.searchParams.get('notificationsEnabled'))
   const notifyOnTurnCompletion = exactBoolean(url.searchParams.get('notifyOnTurnCompletion'))
   const notifyOnTurnFailure = exactBoolean(url.searchParams.get('notifyOnTurnFailure'))
   const notifyOnJobCompletion = exactBoolean(url.searchParams.get('notifyOnJobCompletion'))
   const notifyOnJobFailure = exactBoolean(url.searchParams.get('notifyOnJobFailure'))
+  const notifyOnScheduleCompletion = exactBoolean(url.searchParams.get('notifyOnScheduleCompletion'))
+  const notifyOnScheduleFailure = exactBoolean(url.searchParams.get('notifyOnScheduleFailure'))
   if (mode === undefined || macosMaterial === undefined || windowsMaterial === undefined
-    || openBrowser === undefined || networkExposure === undefined || market === undefined
+    || aaEnabled === undefined || openBrowser === undefined || networkExposure === undefined || market === undefined
     || enabled === undefined || notifyOnTurnCompletion === undefined
     || notifyOnTurnFailure === undefined || notifyOnJobCompletion === undefined
-    || notifyOnJobFailure === undefined) return undefined
+    || notifyOnJobFailure === undefined || notifyOnScheduleCompletion === undefined
+    || notifyOnScheduleFailure === undefined) return undefined
 
   const selection = freezeDesktopSetupWizardSelection({
     mode,
@@ -114,12 +121,15 @@ export function parseDesktopSetupWizardAction(
     openBrowser,
     networkExposure,
     market,
+    aaEnabled,
     notifications: {
       enabled,
       notifyOnTurnCompletion,
       notifyOnTurnFailure,
       notifyOnJobCompletion,
       notifyOnJobFailure,
+      notifyOnScheduleCompletion,
+      notifyOnScheduleFailure,
     },
   })
   return Object.freeze({ action: 'complete' as const, selection })

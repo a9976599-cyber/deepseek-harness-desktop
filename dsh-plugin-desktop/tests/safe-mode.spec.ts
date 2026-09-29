@@ -1,17 +1,17 @@
+import { spawnSync } from 'node:child_process'
 import * as fileSystem from 'node:fs'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import * as profileManager from '../src/profile-manager.ts'
 import {
   cleanupDesktopSafeModeEnvironment,
   DESKTOP_SAFE_MODE_DEFAULTS,
   DESKTOP_SAFE_MODE_PROFILE_NAME,
   desktopSafeModePaths,
   ensureDesktopSafeModeEnvironment,
-  prepareDesktopSafeModeEnvironment,
   resetDesktopSafeModeEnvironment,
 } from '../src/safe-mode.ts'
 
@@ -33,12 +33,33 @@ describe('Desktop Safe Mode environment', () => {
     return root
   }
 
+  async function linkedEnvironment() {
+    const root = await userData()
+    const userDataDir = join(root, 'desktop-user-data')
+    const paths = resetDesktopSafeModeEnvironment(userDataDir)
+    const protectedFiles: string[] = []
+    const links: string[] = []
+    for (const packageName of ['@img/colour', 'ajv', 'ajv-formats']) {
+      const target = join(root, 'installation', 'node_modules', packageName)
+      const link = join(paths.homeDir, 'profiles', 'node_modules', packageName)
+      mkdirSync(target, { recursive: true })
+      mkdirSync(dirname(link), { recursive: true })
+      const file = join(target, 'index.js')
+      writeFileSync(file, 'installation dependency must survive')
+      fileSystem.symlinkSync(target, link, 'junction')
+      protectedFiles.push(file)
+      links.push(link)
+    }
+    return { userDataDir, paths, protectedFiles, links }
+  }
+
   it('uses a visible Safe Mode label for its disposable Profile', () => {
     expect(DESKTOP_SAFE_MODE_PROFILE_NAME).toBe('desktop-safe-mode')
   })
 
   it('uses fixed non-interactive defaults for the disposable Profile', () => {
     expect(DESKTOP_SAFE_MODE_DEFAULTS).toEqual({
+      aaEnabled: false,
       market: 'disabled',
       settings: {
         mode: 'compatibility',
@@ -52,6 +73,8 @@ describe('Desktop Safe Mode environment', () => {
           notifyOnTurnFailure: false,
           notifyOnJobCompletion: false,
           notifyOnJobFailure: false,
+          notifyOnScheduleCompletion: false,
+          notifyOnScheduleFailure: false,
         },
       },
     })
@@ -139,49 +162,6 @@ describe('Desktop Safe Mode environment', () => {
     expect(() => readFileSync(join(paths.homeDir, 'session-data'), 'utf8')).toThrow()
   })
 
-  it('prepares and selects the shipped Web Profile without changing normal Desktop state', async () => {
-    const root = await userData()
-    const normalState = join(root, 'profile-selection', 'state.json')
-    mkdirSync(join(root, 'profile-selection'), { recursive: true })
-    writeFileSync(normalState, JSON.stringify({ version: 2, active: 'stable' }))
-    const paths = prepareDesktopSafeModeEnvironment(root)
-    const statePath = join(paths.userDataDir, 'profile-selection', 'state.json')
-
-    expect(profileManager.readDesktopProfileState(statePath).active).toBe(DESKTOP_SAFE_MODE_PROFILE_NAME)
-    expect(profileManager.listDesktopProfiles(paths.homeDir)).toEqual([
-      expect.objectContaining({
-        name: DESKTOP_SAFE_MODE_PROFILE_NAME,
-        exists: true,
-        webCapable: true,
-        bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'],
-      }),
-    ])
-    expect(ensureDesktopSafeModeEnvironment(root)).toEqual(paths)
-    expect(profileManager.readDesktopProfileState(normalState).active).toBe('stable')
-  })
-
-  it('replaces a previous disposable Profile when Safe Mode is prepared again', async () => {
-    const root = await userData()
-    const paths = prepareDesktopSafeModeEnvironment(root)
-    writeFileSync(join(paths.homeDir, 'session-data'), 'previous run')
-
-    expect(prepareDesktopSafeModeEnvironment(root)).toEqual(paths)
-    expect(existsSync(join(paths.homeDir, 'session-data'))).toBe(false)
-    expect(profileManager.readDesktopProfileState(
-      join(paths.userDataDir, 'profile-selection', 'state.json'),
-    ).active).toBe(DESKTOP_SAFE_MODE_PROFILE_NAME)
-  })
-
-  it('cleans a failed Profile selection and allows the next preparation to retry', async () => {
-    const root = await userData()
-    const failure = Object.assign(new Error('EPERM: selection state is locked'), { code: 'EPERM' })
-    vi.spyOn(profileManager, 'selectDesktopProfile').mockImplementationOnce(() => { throw failure })
-
-    expect(() => prepareDesktopSafeModeEnvironment(root)).toThrow(failure)
-    expect(existsSync(desktopSafeModePaths(root).rootDir)).toBe(false)
-    expect(() => prepareDesktopSafeModeEnvironment(root)).not.toThrow()
-  })
-
   it('removes all disposable data on the next normal launch', async () => {
     const root = await userData()
     const paths = resetDesktopSafeModeEnvironment(root)
@@ -193,6 +173,104 @@ describe('Desktop Safe Mode environment', () => {
     expect(cleanupDesktopSafeModeEnvironment(root)).toBe(false)
     expect(() => readFileSync(join(paths.homeDir, 'profiles', DESKTOP_SAFE_MODE_PROFILE_NAME, 'session.json'))).toThrow()
   })
+
+  it('removes fallback junctions without deleting installation dependencies', async () => {
+    const fixture = await linkedEnvironment()
+    const recursiveRemove = vi.spyOn(fileSystem, 'rmSync')
+
+    expect(cleanupDesktopSafeModeEnvironment(fixture.userDataDir)).toBe(true)
+
+    expect(existsSync(fixture.paths.rootDir)).toBe(false)
+    expect(recursiveRemove).not.toHaveBeenCalled()
+    for (const file of fixture.protectedFiles) {
+      expect(readFileSync(file, 'utf8')).toBe('installation dependency must survive')
+    }
+  })
+
+  it('preserves linked installation dependencies when a new Safe Mode generation replaces the old one', async () => {
+    const fixture = await linkedEnvironment()
+
+    expect(resetDesktopSafeModeEnvironment(fixture.userDataDir)).toEqual(fixture.paths)
+
+    expect(existsSync(join(fixture.paths.homeDir, 'profiles'))).toBe(false)
+    for (const file of fixture.protectedFiles) {
+      expect(readFileSync(file, 'utf8')).toBe('installation dependency must survive')
+    }
+  })
+
+  it('unlinks a Safe Mode root junction without deleting its target', async () => {
+    const root = await userData()
+    const target = join(root, 'unrelated-data')
+    mkdirSync(target)
+    writeFileSync(join(target, 'keep'), 'unrelated data')
+    const paths = desktopSafeModePaths(root)
+    fileSystem.symlinkSync(target, paths.rootDir, 'junction')
+
+    expect(cleanupDesktopSafeModeEnvironment(root)).toBe(true)
+    expect(existsSync(paths.rootDir)).toBe(false)
+    expect(readFileSync(join(target, 'keep'), 'utf8')).toBe('unrelated data')
+  })
+
+  it('removes dangling junctions and read-only disposable files', async () => {
+    const root = await userData()
+    const paths = resetDesktopSafeModeEnvironment(root)
+    const target = join(root, 'removed-installation')
+    mkdirSync(target)
+    fileSystem.symlinkSync(target, join(paths.homeDir, 'dangling'), 'junction')
+    fileSystem.rmdirSync(target)
+    const readOnlyFile = join(paths.userDataDir, 'read-only.json')
+    writeFileSync(readOnlyFile, '{}')
+    fileSystem.chmodSync(readOnlyFile, 0o400)
+
+    expect(cleanupDesktopSafeModeEnvironment(root)).toBe(true)
+    expect(existsSync(paths.rootDir)).toBe(false)
+  })
+
+  it('reports a locked junction after bounded retries without falling back to recursive removal', async () => {
+    const fixture = await linkedEnvironment()
+    const failure = Object.assign(new Error('EBUSY: junction is locked'), { code: 'EBUSY' })
+    const unlink = fileSystem.unlinkSync
+    const removeLink = vi.spyOn(fileSystem, 'unlinkSync').mockImplementation(path => {
+      if (path === fixture.links[0]) throw failure
+      unlink(path)
+    })
+    const wait = vi.spyOn(Atomics, 'wait').mockReturnValue('timed-out')
+    const recursiveRemove = vi.spyOn(fileSystem, 'rmSync')
+
+    expect(() => cleanupDesktopSafeModeEnvironment(fixture.userDataDir)).toThrow(failure)
+
+    expect(removeLink.mock.calls.filter(([path]) => path === fixture.links[0])).toHaveLength(4)
+    expect(wait).toHaveBeenCalledTimes(3)
+    expect(recursiveRemove).not.toHaveBeenCalled()
+    for (const file of fixture.protectedFiles) {
+      expect(readFileSync(file, 'utf8')).toBe('installation dependency must survive')
+    }
+  })
+
+  it.skipIf(process.platform !== 'win32')('preserves installation targets during cleanup in the real Windows Electron runtime', async () => {
+    const fixture = await linkedEnvironment()
+    const executable: unknown = createRequire(import.meta.url)('electron')
+    if (typeof executable !== 'string') throw new TypeError('Electron executable path is unavailable')
+    const source = new URL('../src/safe-mode.ts', import.meta.url).href
+    const result = spawnSync(executable, ['--experimental-strip-types', '--input-type=module', '--eval', `
+      import assert from 'node:assert/strict'
+      import { cleanupDesktopSafeModeEnvironment } from ${JSON.stringify(source)}
+      assert.ok(process.versions.electron)
+      assert.equal(cleanupDesktopSafeModeEnvironment(${JSON.stringify(fixture.userDataDir)}), true)
+    `], {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      encoding: 'utf8',
+      timeout: 30_000,
+      windowsHide: true,
+    })
+
+    expect(result.error, result.stderr).toBeUndefined()
+    expect(result.status, result.stderr).toBe(0)
+    expect(existsSync(fixture.paths.rootDir)).toBe(false)
+    for (const file of fixture.protectedFiles) {
+      expect(readFileSync(file, 'utf8')).toBe('installation dependency must survive')
+    }
+  }, 40_000)
 
   it('rejects relative or NUL-bearing userData paths', () => {
     expect(() => desktopSafeModePaths('relative')).toThrow(/absolute path/u)
